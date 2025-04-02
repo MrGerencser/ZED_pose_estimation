@@ -1,0 +1,10 @@
+general:
+  camera_model: 'zed2i'
+  serial_number: 0  # Set to your camera's serial number
+video:
+  resolution: 2  # 2: HD720, 3: HD1080, 4: HD2K
+  frame_rate: 15
+depth:
+  depth_mode: 2  # 0: NONE, 1: PERFORMANCE, 2: QUALITY
+  min_depth: 0.7
+  max_depth: 20.0

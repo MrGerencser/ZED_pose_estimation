@@ -1,0 +1,34 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${default}",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/opt/ros/humble/include/**",
+        "/home/chris/franka_ros2_ws/install/joint_trajectory_controller/include/**",
+        "/home/chris/franka_ros2_ws/install/franka_robot_state_broadcaster/include/**",
+        "/home/chris/franka_ros2_ws/install/franka_example_controllers/include/**",
+        "/home/chris/franka_ros2_ws/install/franka_semantic_components/include/**",
+        "/home/chris/franka_ros2_ws/install/franka_ign_ros2_control/include/**",
+        "/home/chris/franka_ros2_ws/install/franka_hardware/include/**",
+        "/home/chris/franka_ros2_ws/install/franka_msgs/include/**",
+        "/home/chris/franka_ros2_ws/src/franka_ros2/franka_example_controllers/include/**",
+        "/home/chris/franka_ros2_ws/src/franka_ros2/franka_gazebo/franka_ign_ros2_control/include/**",
+        "/home/chris/franka_ros2_ws/src/franka_ros2/franka_gripper/include/**",
+        "/home/chris/franka_ros2_ws/src/franka_ros2/franka_hardware/include/**",
+        "/home/chris/franka_ros2_ws/src/franka_ros2/franka_robot_state_broadcaster/include/**",
+        "/home/chris/franka_ros2_ws/src/franka_ros2/franka_semantic_components/include/**",
+        "/home/chris/franka_ros2_ws/src/franka_ros2/joint_trajectory_controller/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ROS",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++14"
+    }
+  ],
+  "version": 4
+}
