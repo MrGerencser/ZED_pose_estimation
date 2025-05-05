@@ -15,8 +15,7 @@ from std_msgs.msg import Header
 from rclpy.executors import MultiThreadedExecutor
 import sensor_msgs_py.point_cloud2 as pc2
 from ultralytics import YOLO
-from zed_pose_estimation.vision_pipeline_utils import convert_mask_to_3d_points, downsample_point_cloud_gpu
-from zed_pose_estimation.vision_pipeline_utils import crop_point_cloud_gpu, fuse_point_clouds_centroid, subtract_point_clouds_gpu
+from zed_pose_estimation.vision_pipeline_utils import crop_point_cloud_gpu, fuse_point_clouds_centroid, subtract_point_clouds_gpu, convert_mask_to_3d_points, downsample_point_cloud_gpu
 import open3d as o3d
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from tf2_ros import TransformBroadcaster
@@ -30,7 +29,7 @@ class ZedGpuNode(Node):
         # Original parameters
         self.declare_parameter('camera1_sn', 33137761)
         self.declare_parameter('camera2_sn', 36829049)
-        self.declare_parameter('yolo_model_path', 'models/yolo/best.pt')
+        self.declare_parameter('yolo_model_path', '/franka_ros2_ws/src/zed_pose_estimation/models/yolo/best.pt')
         self.declare_parameter('confidence_threshold', 0.1)
         self.declare_parameter('processing_rate', 10.0)  # Hz
         self.declare_parameter('voxel_size', 0.003)
@@ -41,7 +40,7 @@ class ZedGpuNode(Node):
         
         # New ICP parameters
         self.declare_parameter('icp_enabled', True)
-        self.declare_parameter('model_path', '/home/chris/franka_ros2_ws/src/zed_pose_estimation/models/objects/cone with planar surface.ply')
+        self.declare_parameter('model_path', '/franka_ros2_ws/src/zed_pose_estimation/models/objects/cone with planar surface.ply')
         self.declare_parameter('publish_tf', True)
         self.declare_parameter('icp_distance_threshold', 0.03)
         self.declare_parameter('visualize_icp', False)  # Separate from other visualization

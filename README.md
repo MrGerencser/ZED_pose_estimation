@@ -4,7 +4,7 @@ A ROS2 package for pose estimation and point cloud fusion using ZED stereo camer
 
 ## Prerequisites
 
-1. Install ZED SDK from [stereolabs.com](https://www.stereolabs.com/developers/release/)
+1. Install ZED SDK from [stereolabs.com](https://www.stereolabs.com/en-ch/developers/release/4.2/). This package was made for ZED SDK 4.2.5.
 
 2. Install the Python API:
    ```bash
@@ -19,7 +19,7 @@ A ROS2 package for pose estimation and point cloud fusion using ZED stereo camer
 1. Clone this repository into your ROS2 workspace:
    ```bash
    cd ~/franka_ros2_ws/src/
-   git clone <repository-url> zed_pose_estimation
+   git clone git@github.com:MrGerencser/zed_pose_estimation.git
    ```
 
 2. Build the workspace:
@@ -33,7 +33,7 @@ A ROS2 package for pose estimation and point cloud fusion using ZED stereo camer
    - Current configuration uses cameras with serial numbers:
      - Camera 1: 33137761
      - Camera 2: 36829049
-   - Edit these values in `launch/pointcloud_fusion.launch.py` if needed
+   - Edit these values in `zed_pose_estimation/zed_gpu_node.py` if needed
 
 ## Usage
 
@@ -41,25 +41,64 @@ A ROS2 package for pose estimation and point cloud fusion using ZED stereo camer
 
 Launch the point cloud fusion node:
 ```bash
-ros2 launch zed_pose_estimation pointcloud_fusion.launch.py
+ros2 run zed_pose_estimation zed_gpu_node
+```
+
+To view the output of the node:
+```bash
+ros2 topic echo /perception/object_pose
+```
+
+### Running with Custom Parameters
+
+You can pass parameters directly when launching the node:
+```bash
+ros2 run zed_pose_estimation zed_gpu_node --ros-args -p voxel_size:=0.003 -p visualize:=true
 ```
 
 ### Configuration Options
 
 The pointcloud fusion node accepts the following parameters:
 
-- `voxel_size`: Set the voxel size for point cloud downsampling (default: 0.002)
-- `max_points_per_cloud`: Maximum number of points per cloud (default: 100000)
-- `use_workspace_crop`: Enable workspace cropping (default: True)
-- `visualize`: Enable visualization (default: False)
-- `visualize_interval`: Visualization update interval in seconds (default: 5.0)
-- `transform_and_fuse_of_full_clouds`: Enable full cloud transformation and fusion (default: False)
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `voxel_size` | Set the voxel size for point cloud downsampling | 0.002 |
+| `max_points_per_cloud` | Maximum number of points per cloud | 100000 |
+| `use_workspace_crop` | Enable workspace cropping | True |
+| `visualize` | Enable visualization | False |
+| `visualize_interval` | Visualization update interval in seconds | 5.0 |
+| `transform_and_fuse_of_full_clouds` | Enable full cloud transformation and fusion | False |
 
-You can modify these parameters in the launch file or pass them as command-line arguments.
+## Output Topics
+
+| Topic | Type | Description |
+|-------|------|-------------|
+| `/perception/object_pose` | `geometry_msgs/PoseStamped` | Estimated pose of detected objects |
+| `/perception/point_cloud` | `sensor_msgs/PointCloud2` | Fused point cloud data |
 
 ## Camera Transformation
 
 The camera transformation matrix is defined in `config/transform.yaml`. Modify this file if you need to adjust the relative positioning of the cameras.
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Camera not found**: Ensure the camera serial numbers match those in your configuration.
+   ```bash
+   # Check connected ZED cameras
+   ls /dev/video*
+   ```
+
+2. **CUDA errors**: Verify your NVIDIA GPU drivers are correctly installed:
+   ```bash
+   nvidia-smi
+   ```
+
+3. **Point cloud visualization issues**: Install and use RViz2 to visualize the point clouds:
+   ```bash
+   ros2 run rviz2 rviz2 -d <path_to_workspace>/src/zed_pose_estimation/config/visualization.rviz
+   ```
 
 ## Development
 
@@ -68,3 +107,7 @@ This package follows ROS2 coding standards. To run the linters:
 ```bash
 colcon test --packages-select zed_pose_estimation
 ```
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

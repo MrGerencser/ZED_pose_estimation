@@ -11,5 +11,6 @@
         "/home/chris/franka_ros2_ws/install/franka_gripper/local/lib/python3.10/dist-packages",
         "/home/chris/franka_ros2_ws/install/franka_msgs/local/lib/python3.10/dist-packages"
     ],
-    "cmake.ignoreCMakeListsMissing": true
+    "cmake.ignoreCMakeListsMissing": true,
+    "python.analysis.autoImportCompletions": false,
 }

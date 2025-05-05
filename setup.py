@@ -33,6 +33,8 @@ setup(
             'pointcloud_visualizer_node = zed_pose_estimation.pointcloud_visualizer_node:main',
             'object_segmentation_node = zed_pose_estimation.object_segmentation_node:main',
             'icp_pose_estimation_node = zed_pose_estimation.icp_pose_estimation_node:main',
+            'gpu_segmentation_node = zed_pose_estimation.gpu_segmentation_node:main',
+            'zed_gpu_node = zed_pose_estimation.zed_gpu_node:main',
         ],
     },
 )
