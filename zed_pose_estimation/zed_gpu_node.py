@@ -30,7 +30,7 @@ class ZedGpuNode(Node):
         # Original parameters
         self.declare_parameter('camera1_sn', 33137761)
         self.declare_parameter('camera2_sn', 36829049)
-        self.declare_parameter('yolo_model_path', '/home/chris/franka_ros2_ws/src/zed_pose_estimation/models/yolo/best.pt')
+        self.declare_parameter('yolo_model_path', 'models/yolo/best.pt')
         self.declare_parameter('confidence_threshold', 0.1)
         self.declare_parameter('processing_rate', 10.0)  # Hz
         self.declare_parameter('voxel_size', 0.003)
