@@ -4,9 +4,9 @@ A ROS2 package for pose estimation and point cloud fusion using ZED stereo camer
 
 ## Prerequisites
 
-1. Install ZED SDK from [stereolabs.com](https://www.stereolabs.com/en-ch/developers/). This package requires ZED SDK [4.2.5](https://www.stereolabs.com/en-ch/developers/release/4.2#82af3640d775). Follow the official [Linux Installation Guide](https://www.stereolabs.com/docs/installation/linux/)
+1. Install ZED SDK from [stereolabs.com](https://www.stereolabs.com/en-ch/developers/). This package requires ZED SDK [4.2.5](https://www.stereolabs.com/en-ch/developers/release/4.2#82af3640d775). Follow the official [Linux Installation Guide](https://www.stereolabs.com/docs/installation/linux/).
 
-2. Install the Python API:
+2. Install the Python API (if not done already during Installation):
    ```bash
    cd /usr/local/zed  # Or wherever ZED SDK is installed
    python get_python_api.py
@@ -54,6 +54,28 @@ ros2 topic echo /perception/object_pose
 You can pass parameters directly when launching the node:
 ```bash
 ros2 run zed_pose_estimation zed_gpu_node --ros-args -p voxel_size:=0.003 -p visualize:=true
+```
+
+### Full RL‐Controlled Pipeline
+
+```bash
+ros2 launch cartesian_impedance_control cartesian_impedance_controller.launch.py
+```
+
+```bash
+ros2 run franka_rl_bridge joint_state_listener
+```
+
+```bash
+ros2 run franka_rl_bridge policy_runner --policy /home/chris/franka_ros2_ws/src/franka_rl_bridge/models/model_2950.pt --device cpu
+```
+
+```bash
+ros2 run zed_pose_estimation zed_gpu_node
+```
+
+```bash
+ros2 topic echo /perception/object_pose
 ```
 
 ### Configuration Options
