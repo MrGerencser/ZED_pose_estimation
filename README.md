@@ -4,7 +4,7 @@ A ROS2 package for pose estimation and point cloud fusion using ZED stereo camer
 
 ## Prerequisites
 
-1. Install ZED SDK from [stereolabs.com](https://www.stereolabs.com/en-ch/developers/release/4.2/). This package was made for ZED SDK 4.2.5.
+1. Install ZED SDK from [stereolabs.com](https://www.stereolabs.com/en-ch/developers/). This package requires ZED SDK [4.2.5](https://www.stereolabs.com/en-ch/developers/release/4.2#82af3640d775). Follow the official [Linux Installation Guide](https://www.stereolabs.com/docs/installation/linux/)
 
 2. Install the Python API:
    ```bash
