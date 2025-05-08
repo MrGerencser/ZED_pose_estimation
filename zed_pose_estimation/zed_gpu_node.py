@@ -29,7 +29,7 @@ class ZedGpuNode(Node):
         # Original parameters
         self.declare_parameter('camera1_sn', 33137761)
         self.declare_parameter('camera2_sn', 36829049)
-        self.declare_parameter('yolo_model_path', '/franka_ros2_ws/src/zed_pose_estimation/models/yolo/best.pt')
+        self.declare_parameter('yolo_model_path', '/home/chris/franka_ros2_ws/src/zed_pose_estimation/models/yolo/best.pt')
         self.declare_parameter('confidence_threshold', 0.1)
         self.declare_parameter('processing_rate', 10.0)  # Hz
         self.declare_parameter('voxel_size', 0.003)
@@ -37,13 +37,15 @@ class ZedGpuNode(Node):
         self.declare_parameter('workspace_bounds', [-0.25, 0.75, -0.5, 0.5, -0.05, 2.0])
         self.declare_parameter('publish_visualization', False)
         self.declare_parameter('target_frame', 'panda_link0')
+        self.declare_parameter('transform_file_path', os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), '..', 'config', 'transform.yaml')) # Default path
         
         # New ICP parameters
         self.declare_parameter('icp_enabled', True)
-        self.declare_parameter('model_path', '/franka_ros2_ws/src/zed_pose_estimation/models/objects/cone with planar surface.ply')
+        self.declare_parameter('model_path', '/home/chris/franka_ros2_ws/src/zed_pose_estimation/models/objects/cone with planar surface.ply')
         self.declare_parameter('publish_tf', True)
         self.declare_parameter('icp_distance_threshold', 0.03)
-        self.declare_parameter('visualize_icp', False)  # Separate from other visualization
+        self.declare_parameter('visualize_icp', True)  # Separate from other visualization
         
         # Get original parameters
         self.camera1_sn = self.get_parameter('camera1_sn').get_parameter_value().integer_value
@@ -56,6 +58,8 @@ class ZedGpuNode(Node):
         self.workspace_bounds = self.get_parameter('workspace_bounds').get_parameter_value().double_array_value
         self.publish_viz = self.get_parameter('publish_visualization').get_parameter_value().bool_value
         self.target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
+        self.transform_file_path = self.get_parameter('transform_file_path').get_parameter_value().string_value
+
         
         # Get new ICP parameters
         self.icp_enabled = self.get_parameter('icp_enabled').get_parameter_value().bool_value
@@ -215,40 +219,49 @@ class ZedGpuNode(Node):
 
     def load_transformations(self):
         """Load or define the transformation matrices"""
-        # Define the transformation matrices from the chessboard to the camera frames
-        T_chess_cam1 = np.array([[0.6432, 0.4185, -0.6412, 0.5932],
-                                [-0.7657, 0.3613, -0.5322, 0.7275],
-                                [0.0089, 0.8333, 0.5528, -0.562],
-                                [0.0, 0.0, 0.0, 1.0]])
+        try:
+            with open(self.transform_file_path, 'r') as file:
+                transforms = yaml.safe_load(file)
+            
+            T_chess_cam1_list = transforms['transforms']['T_chess_cam1']
+            T_chess_cam2_list = transforms['transforms']['T_chess_cam2']
+            T_robot_chess_list = transforms['transforms']['T_robot_chess']
 
-        T_chess_cam2 = np.array([[-0.9984, -0.0558, 0.009, 0.108],
-                                [0.0382, -0.5502, 0.8342, -0.9853],
-                                [-0.0416, 0.8332, 0.5514, -0.5135],
-                                [0.0, 0.0, 0.0, 1.0]])
+            T_chess_cam1 = np.array(T_chess_cam1_list)
+            T_chess_cam2 = np.array(T_chess_cam2_list)
+            T_robot_chess = np.array(T_robot_chess_list)
+            
+            self.get_logger().info(f"Loaded transformations from {self.transform_file_path}")
 
-        # This transformation matrix is given by the geometry of the mount and the chessboard
-        T_robot_chess = np.array([[-1.0000, 0.0000, 0.0000, 0.3580],
-                                [0.0000, 1.0000, 0.0000, 0.0300],
-                                [0.0000, 0.0000, -1.0000, 0.0060],
-                                [0.0000, 0.0000, 0.0000, 1.0000]])
+        except FileNotFoundError:
+            self.get_logger().error(f"Transform file not found at {self.transform_file_path}.")
+        
+        except KeyError as e:
+            self.get_logger().error(f"Key error when parsing transform file: {e}.")
 
-        # Calculate the transformation matrices from the robot frame to the camera frames
-        T_robot_cam1 = np.dot(T_robot_chess, T_chess_cam1)
-        T_robot_cam2 = np.dot(T_robot_chess, T_chess_cam2)
+        except Exception as e:
+            self.get_logger().error(f"Failed to load transformations from YAML: {e}.")
 
-        # Extract the rotation matrices and translation vectors
-        self.rotation_robot_cam1 = T_robot_cam1[:3, :3]
-        self.rotation_robot_cam2 = T_robot_cam2[:3, :3]
-        self.origin_cam1 = T_robot_cam1[:3, 3]
-        self.origin_cam2 = T_robot_cam2[:3, 3]
 
-        # Convert to torch tensors
-        self.rotation1_torch = torch.tensor(self.rotation_robot_cam1, dtype=torch.float32, device=self.device)
-        self.origin1_torch = torch.tensor(self.origin_cam1, dtype=torch.float32, device=self.device)
-        self.rotation2_torch = torch.tensor(self.rotation_robot_cam2, dtype=torch.float32, device=self.device)
-        self.origin2_torch = torch.tensor(self.origin_cam2, dtype=torch.float32, device=self.device)
 
-        self.get_logger().info("Transformation matrices loaded")
+        # Calculate the transformation matrices from camera frames to the robot frame
+        T_robot_cam1 = T_robot_chess @ T_chess_cam1
+        T_robot_cam2 = T_robot_chess @ T_chess_cam2
+
+        # Extract rotation and origin for camera 1, and convert to torch tensors
+        self.rotation1 = T_robot_cam1[:3, :3]
+        self.origin1 = T_robot_cam1[:3, 3]
+        self.rotation1_torch = torch.tensor(self.rotation1, dtype=torch.float32, device=self.device)
+        self.origin1_torch = torch.tensor(self.origin1, dtype=torch.float32, device=self.device)
+
+        # Extract rotation and origin for camera 2, and convert to torch tensors
+        self.rotation2 = T_robot_cam2[:3, :3]
+        self.origin2 = T_robot_cam2[:3, 3]
+        self.rotation2_torch = torch.tensor(self.rotation2, dtype=torch.float32, device=self.device)
+        self.origin2_torch = torch.tensor(self.origin2, dtype=torch.float32, device=self.device)
+
+        self.get_logger().info(f"Calculated T_robot_cam1 (Cam1 to Robot):\n{T_robot_cam1}")
+        self.get_logger().info(f"Calculated T_robot_cam2 (Cam2 to Robot):\n{T_robot_cam2}")
 
     def process_frames(self):
         """Main processing loop - timer callback"""
@@ -364,31 +377,35 @@ class ZedGpuNode(Node):
             # self.get_logger().info(f"Model names: {self.model.names}")
             # Step 4: YOLO inference
             yolo_start = time.time()
-            results1 = self.model.track(
-                source=frame1,
+            frame_batch = [frame1, frame2] # Create a batch of frames
+            
+            results_batch = self.model.track(
+                source=frame_batch, # Process batch
                 classes=[1],  # Cone
-                persist=True,
+                persist=True, # Tracker state is persisted by the model
                 retina_masks=True,
                 conf=self.conf_threshold,
                 device=self.device,
-                tracker="ultralytics/cfg/trackers/bytetrack.yaml"
+                tracker="ultralytics/cfg/trackers/bytetrack.yaml" # Tracker config
             )
             
-            results2 = self.model.track(
-                source=frame2,
-                classes=[1],  # Cone
-                persist=True,
-                retina_masks=True,
-                conf=self.conf_threshold,
-                device=self.device,
-                tracker="ultralytics/cfg/trackers/bytetrack.yaml"
-            )
+            # Unpack results for each camera
+            results1 = results_batch[0]  # This is a Results object for camera 1
+            results2 = results_batch[1]  # This is a Results object for camera 2
             
-            # Get masks and class IDs
-            masks1 = results1[0].masks
-            masks2 = results2[0].masks
-            class_ids1 = results1[0].boxes.cls.cpu().numpy() if results1[0].boxes is not None else []
-            class_ids2 = results2[0].boxes.cls.cpu().numpy() if results2[0].boxes is not None else []
+            # Get Masks and Boxes objects directly from the Results objects
+            # These will be None if no detections, or the corresponding Ultralytics objects
+            masks_obj1 = results1.masks 
+            masks_obj2 = results2.masks
+            
+            boxes_obj1 = results1.boxes
+            boxes_obj2 = results2.boxes
+            
+            # Extract class IDs if boxes exist
+            # .cls is a tensor of class indices, .cpu().numpy() converts it
+            # Ensure class_ids are numpy arrays even if empty
+            class_ids1 = boxes_obj1.cls.cpu().numpy() if boxes_obj1 is not None else np.array([])
+            class_ids2 = boxes_obj2.cls.cpu().numpy() if boxes_obj2 is not None else np.array([])
             
             yolo_time = time.time() - yolo_start
             self.timings["YOLO Inference"].append(yolo_time)
@@ -399,34 +416,45 @@ class ZedGpuNode(Node):
             point_clouds_camera2 = []
             
             # Process camera 1 masks
-            if masks1 is not None:
-                depth_map1 = torch.tensor(depth_np1, dtype=torch.float32, device=self.device)
-                for i, mask in enumerate(masks1.data):
-                    mask_indices = torch.nonzero(mask, as_tuple=False)
-                    with torch.amp.autocast('cuda'):
-                        points_3d = convert_mask_to_3d_points(
-                            mask_indices, depth_map1, self.cx1, self.cy1, self.fx1, self.fy1
-                        )
+            # masks_obj1 is a Masks object. masks_obj1.data is a tensor of shape (N, H, W)
+            if masks_obj1 is not None and masks_obj1.data.numel() > 0:
+                depth_map1_torch = torch.tensor(depth_np1, dtype=torch.float32, device=self.device)
+                for i, individual_mask_tensor in enumerate(masks_obj1.data): # Iterate over each detected object's mask
+                    # individual_mask_tensor is one mask (H, W)
+                    # The corresponding class ID is class_ids1[i]
                     
-                    if points_3d.size(0) > 0:
-                        transformed = torch.mm(points_3d, self.rotation1_torch.T) + self.origin1_torch
-                        downsampled = downsample_point_cloud_gpu(transformed, self.voxel_size)
-                        point_clouds_camera1.append((downsampled.cpu().numpy(), int(class_ids1[i])))
+                    mask_indices_full = torch.nonzero(individual_mask_tensor, as_tuple=False)
+                    mask_indices = mask_indices_full # Use all points from the mask
+
+
+                    if mask_indices.numel() > 0: 
+                        with torch.amp.autocast('cuda'):
+                            points_3d = convert_mask_to_3d_points(
+                                mask_indices, depth_map1_torch, self.cx1, self.cy1, self.fx1, self.fy1
+                            )
+                        
+                        if points_3d.size(0) > 0:
+                            transformed = torch.mm(points_3d, self.rotation1_torch.T) + self.origin1_torch
+                            downsampled = downsample_point_cloud_gpu(transformed, self.voxel_size)
+                            point_clouds_camera1.append((downsampled.cpu().numpy(), int(class_ids1[i])))
             
             # Process camera 2 masks
-            if masks2 is not None:
-                depth_map2 = torch.tensor(depth_np2, dtype=torch.float32, device=self.device)
-                for i, mask in enumerate(masks2.data):
-                    mask_indices = torch.nonzero(mask, as_tuple=False)
-                    with torch.amp.autocast('cuda'):
-                        points_3d = convert_mask_to_3d_points(
-                            mask_indices, depth_map2, self.cx2, self.cy2, self.fx2, self.fy2
-                        )
-                    
-                    if points_3d.size(0) > 0:
-                        transformed = torch.mm(points_3d, self.rotation2_torch.T) + self.origin2_torch
-                        downsampled = downsample_point_cloud_gpu(transformed, self.voxel_size)
-                        point_clouds_camera2.append((downsampled.cpu().numpy(), int(class_ids2[i])))
+            if masks_obj2 is not None and masks_obj2.data.numel() > 0:
+                depth_map2_torch = torch.tensor(depth_np2, dtype=torch.float32, device=self.device)
+                for i, individual_mask_tensor in enumerate(masks_obj2.data):
+                    mask_indices_full = torch.nonzero(individual_mask_tensor, as_tuple=False)
+                    mask_indices = mask_indices_full # Use all points from the mask
+
+                    if mask_indices.numel() > 0: 
+                        with torch.amp.autocast('cuda'):
+                            points_3d = convert_mask_to_3d_points(
+                                mask_indices, depth_map2_torch, self.cx2, self.cy2, self.fx2, self.fy2
+                            )
+                        
+                        if points_3d.size(0) > 0:
+                            transformed = torch.mm(points_3d, self.rotation2_torch.T) + self.origin2_torch
+                            downsampled = downsample_point_cloud_gpu(transformed, self.voxel_size)
+                            point_clouds_camera2.append((downsampled.cpu().numpy(), int(class_ids2[i])))
             
             mask_time = time.time() - mask_start
             self.timings["Mask Processing"].append(mask_time)
@@ -489,7 +517,7 @@ class ZedGpuNode(Node):
                             # position[0] += 0.02
                             # add half of height to z position
                             position = pose_matrix[:3, 3].copy()  # Create a writable copy
-                            position[2] += self.reference_model.get_max_bound()[2] / 2
+                            # position[2] += self.reference_model.get_max_bound()[2] / 2
                             rotation_matrix = pose_matrix[:3, :3]
                             rotation = Rotation.from_matrix(rotation_matrix)
                             quat = rotation.as_quat()  # x, y, z, w
@@ -503,10 +531,10 @@ class ZedGpuNode(Node):
                                 quat = rotation.as_quat()  # x, y, z, w
                                 
                             # set the orientation to zero for now
-                            quat[0] = 0
+                            quat[0] = 1
                             quat[1] = 0
                             quat[2] = 0
-                            quat[3] = 1
+                            quat[3] = 0
                             
                             
                             # Create pose message
@@ -516,7 +544,7 @@ class ZedGpuNode(Node):
                             pose_msg.header.frame_id = self.target_frame
                             pose_msg.pose.position.x = float(position[0])
                             pose_msg.pose.position.y = float(position[1])
-                            pose_msg.pose.position.z = float(position[2]) + 0.01
+                            pose_msg.pose.position.z =  0.05
                             pose_msg.pose.orientation.x = float(quat[0])
                             pose_msg.pose.orientation.y = float(quat[1])
                             pose_msg.pose.orientation.z = float(quat[2])
@@ -757,14 +785,14 @@ class ZedGpuNode(Node):
                 transformed_ref.transform(T)
 
                 # --- Visualization
-                if self.visualize_icp:
-                    coord = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
-                    transformed_ref.paint_uniform_color([1, 0, 1])
-                    o3d.visualization.draw_geometries(
-                        [observed_cloud, transformed_ref, coord],
-                        window_name=f"Initial Config PC{i1}-{i2} flip1={flip1} flip2={flip2}",
-                        zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1]
-                    )
+                # if self.visualize_icp:
+                #     coord = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
+                #     transformed_ref.paint_uniform_color([1, 0, 1])
+                #     o3d.visualization.draw_geometries(
+                #         [observed_cloud, transformed_ref, coord],
+                #         window_name=f"Initial Config PC{i1}-{i2} flip1={flip1} flip2={flip2}",
+                #         zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1]
+                #     )
 
                 # --- Run ICP
                 threshold = 0.01
@@ -930,14 +958,14 @@ class ZedGpuNode(Node):
 
             config_name = f"PCA_flip1={cfg['flip1']}_flip2={cfg['flip2']}"
 
-            if self.visualize_icp:
-                rotated_colored = o3d.geometry.PointCloud(rotated_ref)
-                rotated_colored.paint_uniform_color(config_colors[i])
-                o3d.visualization.draw_geometries(
-                    [cropped_cloud, rotated_colored, coord_frame],
-                    zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1],
-                    window_name=f"Initial Alignment - {config_name}"
-                )
+            # if self.visualize_icp:
+            #     rotated_colored = o3d.geometry.PointCloud(rotated_ref)
+            #     rotated_colored.paint_uniform_color(config_colors[i])
+            #     o3d.visualization.draw_geometries(
+            #         [cropped_cloud, rotated_colored, coord_frame],
+            #         zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1],
+            #         window_name=f"Initial Alignment - {config_name}"
+            #     )
 
             for dist_thresh in [0.02, 0.01, 0.005]:
                 result = o3d.pipelines.registration.registration_icp(
@@ -948,15 +976,15 @@ class ZedGpuNode(Node):
 
                 self.get_logger().info(f"{config_name}, Threshold: {dist_thresh:.3f}m - Fitness: {result.fitness:.3f}, RMSE: {result.inlier_rmse:.5f}")
 
-                if self.visualize_icp:
-                    post_icp = o3d.geometry.PointCloud(rotated_ref)
-                    post_icp.transform(result.transformation)
-                    post_icp.paint_uniform_color([0, 1, 1])
-                    o3d.visualization.draw_geometries(
-                        [cropped_cloud, post_icp, coord_frame],
-                        zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1],
-                        window_name=f"After ICP - {config_name}, {dist_thresh}m"
-                    )
+                # if self.visualize_icp:
+                #     post_icp = o3d.geometry.PointCloud(rotated_ref)
+                #     post_icp.transform(result.transformation)
+                #     post_icp.paint_uniform_color([0, 1, 1])
+                #     o3d.visualization.draw_geometries(
+                #         [cropped_cloud, post_icp, coord_frame],
+                #         zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1],
+                #         window_name=f"After ICP - {config_name}, {dist_thresh}m"
+                #     )
 
                 if result.fitness > 0.3 and result.inlier_rmse < best_result["rmse"]:
                     best_result.update({
@@ -1055,6 +1083,7 @@ class ZedGpuNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     
+    node = None # Initialize node to None
     try:
         node = ZedGpuNode()
         
@@ -1070,14 +1099,20 @@ def main(args=None):
                     break
         finally:
             executor.shutdown()
-            node.destroy_node()
-            cv2.destroyAllWindows()  # Make sure windows are closed
+            # node.destroy_node() is called below, no need for cv2.destroyAllWindows() here
+            # as destroy_node() handles it.
     
     except Exception as e:
-        print(f"Error in main: {e}")
-        print(traceback.format_exc())
+        if node:
+            node.get_logger().error(f"Error in main: {e}")
+            node.get_logger().error(traceback.format_exc())
+        else:
+            print(f"Error in main (node not initialized): {e}")
+            print(traceback.format_exc())
     
     finally:
+        if node:
+            node.destroy_node() # This already calls cv2.destroyAllWindows()
         rclpy.shutdown()
 
 
