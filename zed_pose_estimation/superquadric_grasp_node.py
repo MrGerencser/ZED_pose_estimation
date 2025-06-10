@@ -808,6 +808,9 @@ class ZedGpuNode(Node):
 
         self.get_logger().info(f"Fitting {K} superquadrics using ensemble approach")
 
+        #######
+        K = 1
+        #######
         initial_positions = self.initialize_multiple_superquadrics(points_for_ems, K)
         
         fitted_superquadrics = []
