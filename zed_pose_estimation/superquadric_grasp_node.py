@@ -27,7 +27,6 @@ from scipy.spatial.transform import Rotation
 from scipy.spatial import KDTree
 import traceback
 
-
 from zed_pose_estimation.vis2 import visualize_superquadric_grasps
 
 # Add superquadric fitting imports
@@ -41,7 +40,8 @@ class ZedGpuNode(Node):
         # Original parameters
         self.declare_parameter('camera1_sn', 33137761)
         self.declare_parameter('camera2_sn', 36829049)
-        self.declare_parameter('yolo_model_path', '/home/chris/franka_ros2_ws/src/zed_pose_estimation/models/yolo/best.pt')
+        self.declare_parameter('yolo_model_path', '/home/chris/franka_ros2_ws/src/zed_pose_estimation/models/yolo/new_seg_model.pt')
+        # self.declare_parameter('yolo_model_path', 'models/yolo/yolo11x-seg.pt')
         self.declare_parameter('confidence_threshold', 0.1)
         self.declare_parameter('processing_rate', 10.0)  # Hz
         self.declare_parameter('voxel_size', 0.003)
@@ -54,12 +54,11 @@ class ZedGpuNode(Node):
         
         # Superquadric parameters
         self.declare_parameter('superquadric_enabled', True)
-        self.declare_parameter('gripper_jaw_length', 0.254)  # meters
-        self.declare_parameter('gripper_max_opening', 0.18)   # meters
+        self.declare_parameter('gripper_jaw_length', 0.061)  # meters
+        self.declare_parameter('gripper_max_opening', 0.08)   # meters
         self.declare_parameter('outlier_ratio', 0.2)         # EMS parameter
         self.declare_parameter('publish_tf', True)
-        self.declare_parameter('visualize', False)
-        
+        self.declare_parameter('visualize', True)
         
         # Get parameters
         self.camera1_sn = self.get_parameter('camera1_sn').get_parameter_value().integer_value
@@ -98,8 +97,7 @@ class ZedGpuNode(Node):
         
         self.future_shutdown = False
 
-        self.class_names = {0: "Box", 1: "Cone", 2: "Cover", 3: "Plier",
-                           4: "Robot", 5: "Screw Driver"}
+        self.class_names = {0: 'Cone', 1: 'Cup', 2: 'Mallet', 3: 'Screw Driver', 4: 'Sunscreen'}
 
         # Dictionary to store timings for benchmarking
         self.timings = {
@@ -143,8 +141,6 @@ class ZedGpuNode(Node):
             PointCloud2, '/perception/fused_workspace_cloud', 10)
         self.fused_objects_publisher = self.create_publisher(
             PointCloud2, '/perception/fused_objects_cloud', 10)
-        self.subtracted_cloud_publisher = self.create_publisher(
-            PointCloud2, '/perception/subtracted_cloud', 10)
         
         # Set up timer for processing
         self.timer = self.create_timer(1.0/self.processing_rate, self.process_frames)
@@ -238,8 +234,6 @@ class ZedGpuNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to load transformations from YAML: {e}.")
 
-
-
         # Calculate the transformation matrices from camera frames to the robot frame
         T_robot_cam1 = T_robot_chess @ T_chess_cam1
         T_robot_cam2 = T_robot_chess @ T_chess_cam2
@@ -274,20 +268,56 @@ class ZedGpuNode(Node):
             self.get_logger().info("Camera intrinsics updated")
             
         except Exception as e:
-            self.get_logger().error(f"Failed to update intrinsics: {e}")
+            self.get_logger().error(f"Failed to update intrinsics: {e}")   
+    
     
     def process_frames(self):
         """Main processing loop - timer callback"""
         try:
             start_time = time.time()
             
-            # Check if cameras are ready
-            if (self.zed1.grab() != sl.ERROR_CODE.SUCCESS or 
-                self.zed2.grab() != sl.ERROR_CODE.SUCCESS):
-                self.get_logger().warn("Failed to grab frames from cameras")
+            # Step 1: Capture and validate frames
+            frame1, frame2 = self._capture_and_retrieve_frames()
+            if frame1 is None or frame2 is None:
                 return
+        
+
+            # Step 2: Retrieve and process depth maps
+            depth_np1, depth_np2 = self._retrieve_depth_maps()
+            if depth_np1 is None or depth_np2 is None:
+                return
+                
+            # Step 3: Process point clouds
+            pc1_cropped, pc2_cropped, fused_workspace_np, pcd_fused_workspace = self._process_point_clouds()
+            if pc1_cropped is None:
+                return
+                
+            # Step 4: Run YOLO detection
+            results1, results2, class_ids1, class_ids2 = self._run_yolo_detection([frame1, frame2])
             
-            # Update intrinsics every 100 frames
+            # Step 5: Extract object point clouds from detections
+            fused_object_points, fused_object_classes, fused_objects_np = self._extract_object_point_clouds(
+                results1, results2, class_ids1, class_ids2, depth_np1, depth_np2
+            )
+
+            # Step 7: Generate grasps using superquadric fitting
+            if self.superquadric_enabled and fused_object_points:
+                self._process_superquadric_grasps(fused_object_points, fused_object_classes, fused_workspace_np)
+            
+            # Step 8: Publish point clouds
+            self._publish_point_clouds(fused_workspace_np, fused_objects_np)
+            
+            # Step 9: Update visualization and FPS
+            self._update_visualization_and_fps(frame1, frame2, results1, results2, start_time)
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in process_frames: {e}")
+            self.get_logger().error(traceback.format_exc())
+
+    def _capture_and_retrieve_frames(self):
+        """Capture frames from both cameras and convert them to OpenCV format"""
+        try:
+            # Update frame count for intrinsics refresh
             if hasattr(self, 'frame_count'):
                 self.frame_count += 1
             else:
@@ -295,40 +325,73 @@ class ZedGpuNode(Node):
                 
             if self.frame_count % 100 == 0:
                 self.update_camera_intrinsics()
-                
-            # Step 1: Frame retrieval
+            
+            # Check if cameras are ready
+            if (self.zed1.grab() != sl.ERROR_CODE.SUCCESS or 
+                self.zed2.grab() != sl.ERROR_CODE.SUCCESS):
+                self.get_logger().warn("Failed to grab frames from cameras")
+                return None, None
+            
+            # Retrieve frames
             retrieval_start = time.time()
             self.zed1.retrieve_image(self.image1, view=sl.VIEW.LEFT)
             self.zed2.retrieve_image(self.image2, view=sl.VIEW.LEFT)
+            
+            # Convert to OpenCV format
             frame1 = self.image1.get_data()
             frame2 = self.image2.get_data()
             frame1 = cv2.cvtColor(frame1, cv2.COLOR_BGRA2BGR)
             frame2 = cv2.cvtColor(frame2, cv2.COLOR_BGRA2BGR)
+            
             retrieval_time = time.time() - retrieval_start
             self.timings["Frame Retrieval"].append(retrieval_time)
             
-            # Step 2: Depth retrieval
+            return frame1, frame2
+            
+        except Exception as e:
+            self.get_logger().error(f"Error capturing frames: {e}")
+            return None, None
+
+    def _retrieve_depth_maps(self):
+        """Retrieve depth maps from both cameras"""
+        try:
             depth_start = time.time()
+            
             depth_result1 = self.zed1.retrieve_measure(self.depth1, measure=sl.MEASURE.DEPTH)
             depth_result2 = self.zed2.retrieve_measure(self.depth2, measure=sl.MEASURE.DEPTH)
+            
             if depth_result1 != sl.ERROR_CODE.SUCCESS or depth_result2 != sl.ERROR_CODE.SUCCESS:
                 self.get_logger().warn(f"Failed to retrieve depth maps: {depth_result1}, {depth_result2}")
-                return
+                return None, None
+                
             depth_np1 = self.depth1.get_data()
             depth_np2 = self.depth2.get_data()
+            
             depth_time = time.time() - depth_start
             self.timings["Depth Retrieval"].append(depth_time)
             
-            # Step 3: Point cloud processing
+            return depth_np1, depth_np2
+            
+        except Exception as e:
+            self.get_logger().error(f"Error retrieving depth maps: {e}")
+            return None, None
+
+    def _process_point_clouds(self):
+        """Process point clouds from both cameras and fuse them"""
+        try:
             pc_start = time.time()
+            
+            # Retrieve point clouds
             self.zed1.retrieve_measure(self.point_cloud1_ws, measure=sl.MEASURE.XYZ)
             self.zed2.retrieve_measure(self.point_cloud2_ws, measure=sl.MEASURE.XYZ)
             
+            # Convert to torch tensors
             pc1_tensor = torch.tensor(self.point_cloud1_ws.get_data()[:, :, :3], 
                                      dtype=torch.float32, device=self.device).reshape(-1, 3)
             pc2_tensor = torch.tensor(self.point_cloud2_ws.get_data()[:, :, :3], 
                                      dtype=torch.float32, device=self.device).reshape(-1, 3)
             
+            # Filter valid points
             valid_mask1 = torch.isfinite(pc1_tensor).all(dim=1)
             valid_mask2 = torch.isfinite(pc2_tensor).all(dim=1)
             pc1_tensor = pc1_tensor[valid_mask1]
@@ -338,7 +401,7 @@ class ZedGpuNode(Node):
             pc1_transformed = torch.mm(pc1_tensor, self.rotation1_torch.T) + self.origin1_torch
             pc2_transformed = torch.mm(pc2_tensor, self.rotation2_torch.T) + self.origin2_torch
             
-            # Crop to workspace
+            # Crop to workspace bounds
             x_bounds = (self.workspace_bounds[0], self.workspace_bounds[1])
             y_bounds = (self.workspace_bounds[2], self.workspace_bounds[3])
             z_bounds = (self.workspace_bounds[4], self.workspace_bounds[5])
@@ -349,30 +412,32 @@ class ZedGpuNode(Node):
             # Fuse workspace point clouds
             fused_workspace = torch.cat((pc1_cropped, pc2_cropped), dim=0)
             fused_workspace_np = fused_workspace.cpu().numpy()
+            
+            # Create Open3D point cloud
             pcd_fused_workspace = o3d.geometry.PointCloud()
             pcd_fused_workspace.points = o3d.utility.Vector3dVector(fused_workspace_np)
-            # pcd_fused_workspace = self.preprocess_point_cloud(pcd_fused_workspace)
             
-            #visualize fused workspace
+            # Optional visualization
             if self.visualize:
                 o3d.visualization.draw_geometries([pcd_fused_workspace], window_name="Fused Workspace Point Cloud")
-                
-            
-            # Save the fused workspace point cloud
-            fused_workspace_xyz = o3d.geometry.PointCloud()
-            fused_workspace_xyz.points = pcd_fused_workspace.points
-            # o3d.io.write_point_cloud("pointclouds/fused_workspace_xyz.ply", fused_workspace_xyz)
             
             pc_time = time.time() - pc_start
             self.timings["Point Cloud Processing"].append(pc_time)
             
-            # Step 4: YOLO inference
+            return pc1_cropped, pc2_cropped, fused_workspace_np, pcd_fused_workspace
+            
+        except Exception as e:
+            self.get_logger().error(f"Error processing point clouds: {e}")
+            return None, None, None, None
+
+    def _run_yolo_detection(self, frames):
+        """Run YOLO detection on both camera frames"""
+        try:
             yolo_start = time.time()
-            frame_batch = [frame1, frame2]
             
             results_batch = self.model.track(
-                source=frame_batch,
-                classes=[1],  # Cone
+                source=frames,
+                classes=[0, 1, 2, 3, 4],  # Cone, Cup, Mallet, Screw Driver, Sunscreen
                 persist=True,
                 retina_masks=True,
                 conf=self.conf_threshold,
@@ -380,36 +445,43 @@ class ZedGpuNode(Node):
                 tracker="ultralytics/cfg/trackers/bytetrack.yaml"
             )
             
-            results1 = results_batch[0]
-            results2 = results_batch[1]
+            results1, results2 = results_batch[0], results_batch[1]
             
-            masks_obj1 = results1.masks 
-            masks_obj2 = results2.masks
-            boxes_obj1 = results1.boxes
-            boxes_obj2 = results2.boxes
-            
-            class_ids1 = boxes_obj1.cls.cpu().numpy() if boxes_obj1 is not None else np.array([])
-            class_ids2 = boxes_obj2.cls.cpu().numpy() if boxes_obj2 is not None else np.array([])
+            # Extract class IDs
+            class_ids1 = (results1.boxes.cls.cpu().numpy() 
+                         if results1.boxes is not None else np.array([]))
+            class_ids2 = (results2.boxes.cls.cpu().numpy() 
+                         if results2.boxes is not None else np.array([]))
             
             yolo_time = time.time() - yolo_start
             self.timings["YOLO Inference"].append(yolo_time)
             
-            # Step 5: Process masks to get object point clouds
+            return results1, results2, class_ids1, class_ids2
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in YOLO detection: {e}")
+            return None, None, None, None
+
+    def _extract_object_point_clouds(self, results1, results2, class_ids1, class_ids2, depth_np1, depth_np2):
+        """Extract object point clouds from detection masks"""
+        try:
             mask_start = time.time()
+            
             point_clouds_camera1 = []
             point_clouds_camera2 = []
             
             # Process camera 1 masks
-            if masks_obj1 is not None and masks_obj1.data.numel() > 0:
+            if results1.masks is not None and results1.masks.data.numel() > 0:
                 depth_map1_torch = torch.tensor(depth_np1, dtype=torch.float32, device=self.device)
-                for i, individual_mask_tensor in enumerate(masks_obj1.data):
-                    mask_indices_full = torch.nonzero(individual_mask_tensor, as_tuple=False)
-                    mask_indices = mask_indices_full
+                
+                for i, individual_mask_tensor in enumerate(results1.masks.data):
+                    mask_indices = torch.nonzero(individual_mask_tensor, as_tuple=False)
 
                     if mask_indices.numel() > 0: 
                         with torch.amp.autocast('cuda'):
                             points_3d = convert_mask_to_3d_points(
-                                mask_indices, depth_map1_torch, self.cx1, self.cy1, self.fx1, self.fy1
+                                mask_indices, depth_map1_torch, 
+                                self.cx1, self.cy1, self.fx1, self.fy1
                             )
                         
                         if points_3d.size(0) > 0:
@@ -417,27 +489,24 @@ class ZedGpuNode(Node):
                             point_clouds_camera1.append((transformed.cpu().numpy(), int(class_ids1[i])))
             
             # Process camera 2 masks
-            if masks_obj2 is not None and masks_obj2.data.numel() > 0:
+            if results2.masks is not None and results2.masks.data.numel() > 0:
                 depth_map2_torch = torch.tensor(depth_np2, dtype=torch.float32, device=self.device)
-                for i, individual_mask_tensor in enumerate(masks_obj2.data):
-                    mask_indices_full = torch.nonzero(individual_mask_tensor, as_tuple=False)
-                    mask_indices = mask_indices_full
+                
+                for i, individual_mask_tensor in enumerate(results2.masks.data):
+                    mask_indices = torch.nonzero(individual_mask_tensor, as_tuple=False)
 
                     if mask_indices.numel() > 0: 
                         with torch.amp.autocast('cuda'):
                             points_3d = convert_mask_to_3d_points(
-                                mask_indices, depth_map2_torch, self.cx2, self.cy2, self.fx2, self.fy2
+                                mask_indices, depth_map2_torch,
+                                self.cx2, self.cy2, self.fx2, self.fy2
                             )
                         
                         if points_3d.size(0) > 0:
                             transformed = torch.mm(points_3d, self.rotation2_torch.T) + self.origin2_torch
                             point_clouds_camera2.append((transformed.cpu().numpy(), int(class_ids2[i])))
             
-            mask_time = time.time() - mask_start
-            self.timings["Mask Processing"].append(mask_time)
-            
-            # Step 6: Fuse object point clouds
-            fusion_start = time.time()
+            # Fuse object point clouds
             _, _, fused_objects = fuse_point_clouds_centroid(
                 point_clouds_camera1, point_clouds_camera2, self.distance_threshold
             )
@@ -445,135 +514,138 @@ class ZedGpuNode(Node):
             fused_object_points = [pc for pc, _ in fused_objects]
             fused_object_classes = [cls for _, cls in fused_objects]
             
-            if fused_object_points:
-                fused_objects_np = np.vstack(fused_object_points)
-            else:
-                fused_objects_np = np.empty((0, 3))
-                
-            fusion_time = time.time() - fusion_start
-            self.timings["Point Cloud Fusion"].append(fusion_time)
+            fused_objects_np = (np.vstack(fused_object_points) 
+                               if fused_object_points else np.empty((0, 3)))
             
-            # Step 7: Subtract objects from workspace
-            subtraction_start = time.time()
-            subtracted_cloud = subtract_point_clouds_gpu(
-                fused_workspace_np, fused_objects_np, distance_threshold=0.06
-            )
-            subtraction_time = time.time() - subtraction_start
-            self.timings["Subtraction"].append(subtraction_time)
+            mask_time = time.time() - mask_start
+            self.timings["Mask Processing"].append(mask_time)
             
-            # Step 8: Generate grasps using superquadric fitting
-            if self.superquadric_enabled and fused_object_points and len(fused_object_points) > 0:
-                grasp_start = time.time()
-                
-                for i, (object_points, class_id) in enumerate(zip(fused_object_points, fused_object_classes)):
-                    if len(object_points) < 100:
-                        self.get_logger().warn(f"Object {i} has too few points ({len(object_points)}) for superquadric fitting")
-                        continue
+            return fused_object_points, fused_object_classes, fused_objects_np
+            
+        except Exception as e:
+            self.get_logger().error(f"Error extracting object point clouds: {e}")
+            return [], [], np.empty((0, 3))
+
+
+
+    def _process_superquadric_grasps(self, fused_object_points, fused_object_classes, fused_workspace_np):
+        """Process objects for superquadric fitting and grasp generation"""
+        try:
+            grasp_start = time.time()
+
+            graspable_classes = [0, 1, 2, 3, 4]  # Cone, Cup, Mallet, Screw Driver, Sunscreen
+
+            for i, (object_points, class_id) in enumerate(zip(fused_object_points, fused_object_classes)):
+                if len(object_points) < 100:
+                    self.get_logger().warn(f"Object {i} has too few points ({len(object_points)}) for superquadric fitting")
+                    continue
                     
-                    if class_id in [1]:  # Cone
-                        self.get_logger().info(f"Processing {self.class_names.get(class_id, 'Unknown')} with superquadric fitting")
+                if class_id in graspable_classes:
+                    object_name = self.class_names.get(class_id, f'Class_{class_id}')
+                    self.get_logger().info(f"Processing {object_name} (class {class_id}) with superquadric fitting")
+                    
+                    try:
+                        result = self.generate_superquadric_grasps(
+                            object_points, 
+                            fused_workspace_np,
+                            class_id
+                        )
                         
-                        try:
-                            result = self.generate_superquadric_grasps(
-                                object_points, 
-                                fused_workspace_np,
-                                class_id
-                            )
-                            
-                            # Handle the result properly
-                            if result and len(result) == 2:
-                                grasp_poses, sq_recovered = result
-                            else:
-                                grasp_poses, sq_recovered = [], None
-                            
-                            if grasp_poses and len(grasp_poses) > 0:
-                                # Get the best grasp pose (already in robot frame, already EE position)
-                                best_grasp = grasp_poses[0]
-                                
-                                print(f"Best grasp for object {i} (class {class_id}): {best_grasp}")
-                                
-                                # Extract position and quaternion from the 4x4 transformation matrix
-                                pos = best_grasp[:3, 3]  # Extract translation
-                                rot_matrix = best_grasp[:3, :3]  # Extract rotation matrix
-                                
-                                # Convert rotation matrix to quaternion
-                                from scipy.spatial.transform import Rotation as R_scipy
-                                quat = R_scipy.from_matrix(rot_matrix).as_quat()  # Returns [x, y, z, w]
-                                euler = R_scipy.from_matrix(rot_matrix).as_euler('xyz')
-                                
-                                print(f"Best grasp position: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
-                                print(f"Best grasp euler angles: [{euler[0]:.3f}, {euler[1]:.3f}, {euler[2]:.3f}]")
-                                print(f"Best grasp quaternion: [{quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f}]")
-                                
-                                franka_home_euler = np.array([np.pi, 0.0, 0.0])  # Home position euler angles
-                                euler_diff = euler - franka_home_euler
-
-                                franka_home_rotation = R_scipy.from_euler('xyz', franka_home_euler)
-                                
-                                # convert the best grasp rotation to the ee frame
-                                best_grasp_rotation = R_scipy.from_matrix(rot_matrix)
-                                best_grasp_rotation_ee = franka_home_rotation.inv() * best_grasp_rotation
-
-                                print(f"Best grasp rotation in EE frame: {best_grasp_rotation_ee.as_euler('xyz')}")
-                                
-                                quat_ee = best_grasp_rotation_ee.as_quat()  # Convert to quaternion in EE frame
-
-                                # Get the consistent_euler from sq_recovered
-                                consistent_euler = R_scipy.from_matrix(sq_recovered.RotM).as_euler('xyz')
-
-                                # Get points_for_ems from the object_points (same data that was used for fitting)
-                                points_for_ems = object_points  # object point cloud data
-
-                                if self.visualize:
-                                    visualize_superquadric_grasps(
-                                                point_cloud_data=points_for_ems,
-                                                superquadric_params={
-                                                    'shape': sq_recovered.shape,
-                                                    'scale': sq_recovered.scale,
-                                                    'euler': consistent_euler,
-                                                    'translation': sq_recovered.translation
-                                                },
-                                                grasp_poses=[best_grasp],  # ← Final corrected pose
-                                                show_sweep_volume=False,
-                                                window_name="FINAL Published Grasp Pose (After Corrections)",
-                                            )
-
-                                
-                                # Create and publish pose message
-                                pose_msg = PoseStamped()
-                                pose_msg.header = Header()
-                                pose_msg.header.stamp = self.get_clock().now().to_msg()
-                                pose_msg.header.frame_id = self.target_frame
-                                pose_msg.pose.position.x = float(pos[0])
-                                pose_msg.pose.position.y = float(pos[1])
-                                pose_msg.pose.position.z = float(pos[2]) + 0.02  # Add small offset above object
-                                pose_msg.pose.orientation.x = float(quat_ee[0])
-                                pose_msg.pose.orientation.y = float(quat_ee[1])
-                                pose_msg.pose.orientation.z = float(quat_ee[2])
-                                pose_msg.pose.orientation.w = float(quat_ee[3])
-
-                                # Publish the grasp pose
-                                self.pose_publisher.publish(pose_msg)
-                                self.get_logger().info(f"Published grasp pose at: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
-                                
-                                # Optionally publish TF transform as well
-                                if self.publish_tf:
-                                    self.publish_transform(
-                                        position=pos,
-                                        quaternion=quat,
-                                        parent_frame=self.target_frame,
-                                        child_frame=f"object_{class_id}_grasp"
-                                    )
-                                    
+                        # Handle the result properly
+                        if result and len(result) == 2:
+                            grasp_poses, sq_recovered = result
+                        else:
+                            grasp_poses, sq_recovered = [], None
                         
-                                    
-                        except Exception as e:
-                            self.get_logger().error(f"Error in superquadric grasp generation for object {i}: {e}")
-                            self.get_logger().error(traceback.format_exc())
-                
-                grasp_time = time.time() - grasp_start
-                self.timings["Superquadric Grasp Generation"].append(grasp_time)
+                        if grasp_poses and len(grasp_poses) > 0:
+                            self._publish_best_grasp_pose(grasp_poses, sq_recovered, i, class_id)
+                            
+                    except Exception as e:
+                        self.get_logger().error(f"Error in superquadric grasp generation for {object_name}: {e}")
+                        self.get_logger().error(traceback.format_exc())
+                else:
+                    object_name = self.class_names.get(class_id, f'Class_{class_id}')
+                    if class_id == 4:  # Robot
+                        self.get_logger().info(f"Skipping {object_name} (class {class_id}) - robot not graspable")
+                    else:
+                        self.get_logger().info(f"Skipping {object_name} (class {class_id}) - not in graspable classes")
             
+            grasp_time = time.time() - grasp_start
+            self.timings["Superquadric Grasp Generation"].append(grasp_time)
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in superquadric grasp processing: {e}")
+
+    def _publish_best_grasp_pose(self, grasp_poses, sq_recovered, object_index, class_id):
+        """Publish the best grasp pose for a detected object"""
+        try:
+            # Get the best grasp pose (already in robot frame, already EE position)
+            best_grasp = grasp_poses[0]
+            
+            print(f"Best grasp for object {object_index} (class {class_id}): {best_grasp}")
+            
+            # Extract position and quaternion from the 4x4 transformation matrix
+            pos = best_grasp[:3, 3]  # Extract translation
+            rot_matrix = best_grasp[:3, :3]  # Extract rotation matrix
+            
+            # Convert rotation matrix to quaternion
+            from scipy.spatial.transform import Rotation as R_scipy
+            quat = R_scipy.from_matrix(rot_matrix).as_quat()  # Returns [x, y, z, w]
+            euler = R_scipy.from_matrix(rot_matrix).as_euler('xyz')
+            
+            print(f"Best grasp position: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+            print(f"Best grasp euler angles: [{euler[0]:.3f}, {euler[1]:.3f}, {euler[2]:.3f}]")
+            print(f"Best grasp quaternion: [{quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f}]")
+            
+            # Convert to end-effector frame
+            franka_home_euler = np.array([np.pi, 0.0, 0.0])  # Home position euler angles
+            euler_diff = euler - franka_home_euler
+
+            franka_home_rotation = R_scipy.from_euler('xyz', franka_home_euler)
+            best_grasp_rotation = R_scipy.from_matrix(rot_matrix)
+            best_grasp_rotation_ee = franka_home_rotation.inv() * best_grasp_rotation
+
+            print(f"Best grasp rotation in EE frame: {best_grasp_rotation_ee.as_euler('xyz')}")
+            quat_ee = best_grasp_rotation_ee.as_quat()  # Convert to quaternion in EE frame
+
+            # Visualization
+            if self.visualize and sq_recovered is not None:
+                consistent_euler = R_scipy.from_matrix(sq_recovered.RotM).as_euler('xyz')
+                # Use object points for visualization (you'll need to pass this from the calling function)
+                # For now, we'll skip the detailed visualization in this refactored version
+                
+            # Create and publish pose message
+            pose_msg = PoseStamped()
+            pose_msg.header = Header()
+            pose_msg.header.stamp = self.get_clock().now().to_msg()
+            pose_msg.header.frame_id = self.target_frame
+            pose_msg.pose.position.x = float(pos[0])
+            pose_msg.pose.position.y = float(pos[1])
+            pose_msg.pose.position.z = float(pos[2]) + 0.01  # Slight offset to avoid collision
+            pose_msg.pose.orientation.x = float(quat_ee[0])
+            pose_msg.pose.orientation.y = float(quat_ee[1])
+            pose_msg.pose.orientation.z = float(quat_ee[2])
+            pose_msg.pose.orientation.w = float(quat_ee[3])
+
+            # Publish the grasp pose
+            self.pose_publisher.publish(pose_msg)
+            self.get_logger().info(f"Published grasp pose at: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+            
+            # Optionally publish TF transform as well
+            if self.publish_tf:
+                self.publish_transform(
+                    position=pos,
+                    quaternion=quat,
+                    parent_frame=self.target_frame,
+                    child_frame=f"object_{class_id}_grasp"
+                )
+                
+        except Exception as e:
+            self.get_logger().error(f"Error publishing grasp pose: {e}")
+
+    def _publish_point_clouds(self, fused_workspace_np, fused_objects_np):
+        """Publish all point clouds as ROS messages"""
+        try:
             # Create header for point cloud messages
             header = Header()
             header.stamp = self.get_clock().now().to_msg()
@@ -586,9 +658,13 @@ class ZedGpuNode(Node):
             if fused_objects_np.size > 0:
                 self.fused_objects_publisher.publish(pc2.create_cloud_xyz32(header, fused_objects_np))
                 
-            if subtracted_cloud.size > 0:
-                self.subtracted_cloud_publisher.publish(pc2.create_cloud_xyz32(header, subtracted_cloud))
-            
+                
+        except Exception as e:
+            self.get_logger().error(f"Error publishing point clouds: {e}")
+
+    def _update_visualization_and_fps(self, frame1, frame2, results1, results2, start_time):
+        """Update visualization display and calculate FPS"""
+        try:
             # Calculate and update FPS
             total_time = time.time() - start_time
             self.timings["Total Time"].append(total_time)
@@ -605,24 +681,28 @@ class ZedGpuNode(Node):
                     display1 = frame1.copy()
                     display2 = frame2.copy()
                     
+                    # Draw detection boxes on frame 1
                     if results1[0].boxes is not None and len(results1[0].boxes) > 0:
                         for box in results1[0].boxes.xyxy.cpu().numpy():
                             x1, y1, x2, y2 = [int(v) for v in box]
                             cv2.rectangle(display1, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     
+                    # Draw detection boxes on frame 2
                     if results2[0].boxes is not None and len(results2[0].boxes) > 0:
                         for box in results2[0].boxes.xyxy.cpu().numpy():
                             x1, y1, x2, y2 = [int(v) for v in box]
                             cv2.rectangle(display2, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     
+                    # Add FPS text
                     cv2.putText(display1, f"FPS: {avg_fps:.1f}", (20, 40), 
                               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
                     
+                    # Resize and combine displays
                     display1 = cv2.resize(display1, (640, 360))
                     display2 = cv2.resize(display2, (640, 360))
-                    
                     display = np.hconcat([display1, display2])
                     
+                    # Show display and check for quit
                     cv2.imshow("YOLO Detection", display)
                     key = cv2.waitKey(1)
                     
@@ -633,13 +713,9 @@ class ZedGpuNode(Node):
                 except Exception as viz_error:
                     self.get_logger().error(f"Visualization error: {viz_error}")
                     self.get_logger().error(traceback.format_exc())
-            
-            point_clouds_camera1.clear()
-            point_clouds_camera2.clear()
-            
+                    
         except Exception as e:
-            self.get_logger().error(f"Error in process_frames: {e}")
-            self.get_logger().error(traceback.format_exc())
+            self.get_logger().error(f"Error updating visualization and FPS: {e}")
 
     def preprocess_point_cloud(self, pcd):
         """Preprocess point cloud for superquadric fitting"""
@@ -680,7 +756,7 @@ class ZedGpuNode(Node):
         X_size = int(point_count)  # |X| = number of points
         
         if X_size < 8000:
-            K = 1
+            K = 6
             self.get_logger().info(f"Point count: {X_size} < 8000, using K = 6")
         else:
             # K = 8 + 2 × ⌊(|X| - 8000) / 4000⌋
@@ -699,104 +775,79 @@ class ZedGpuNode(Node):
 
     def initialize_multiple_superquadrics(self, points_for_ems, K=None):
         """
-        Initialize K superquadrics at different positions as described in the paper
-        Section 3: "6+1 superquadrics at different positions are initialized"
-        
-        Args:
-            points_for_ems: Point cloud data
-            K: Number of superquadrics (if None, calculate using paper's formula)
+        Initialize K+1 superquadrics using the paper's exact method:
+        - K-means clustering into K subsets
+        - Each SQ initialized as ellipsoid with MoI = cluster_MoI / 2
+        - One extra SQ for the whole object
         """
+        from sklearn.cluster import KMeans
         
-        # Calculate K using paper's formula if not provided
         if K is None:
             K = self.calculate_k_superquadrics(len(points_for_ems))
         
-        # Calculate point cloud properties
-        points_center = np.mean(points_for_ems, axis=0)
-        points_bounds = np.max(points_for_ems, axis=0) - np.min(points_for_ems, axis=0)
+        # 1. K-means clustering
+        kmeans = KMeans(n_clusters=K, random_state=42)
+        cluster_labels = kmeans.fit_predict(points_for_ems)
         
-        self.get_logger().info(f"Initializing {K} superquadrics for {len(points_for_ems)} points")
-        self.get_logger().info(f"Object center: {points_center}")
-        self.get_logger().info(f"Object bounds: {points_bounds}")
+        initial_superquadrics = []
         
-        # Calculate initial positions for K superquadrics
-        initial_positions = []
+        # 2. Initialize K superquadrics from clusters
+        for i in range(K):
+            cluster_points = points_for_ems[cluster_labels == i]
+            if len(cluster_points) > 10:  # Ensure sufficient points
+                # Calculate moment of inertia for this cluster
+                center = np.mean(cluster_points, axis=0)
+                # Initialize SQ with MoI-based ellipsoid parameters
+                initial_superquadrics.append({
+                    'center': center,
+                    'points': cluster_points,
+                    'type': 'cluster'
+                })
         
-        # Multiple initialization strategies based on K
+        # 3. Add one extra SQ for the whole object (K+1)
+        global_center = np.mean(points_for_ems, axis=0)
+        initial_superquadrics.append({
+            'center': global_center,
+            'points': points_for_ems,
+            'type': 'global'
+        })
         
-        if K == 6:
-            # For smaller objects (< 8000 points): Use 3D grid pattern
-            # Place 6 superquadrics in a 2×3 grid pattern around the object
-            offsets = [
-                [-0.3, -0.2, 0.0],   # Left-back
-                [-0.3,  0.2, 0.0],   # Left-front  
-                [ 0.0, -0.2, 0.0],   # Center-back
-                [ 0.0,  0.2, 0.0],   # Center-front
-                [ 0.3, -0.2, 0.0],   # Right-back
-                [ 0.3,  0.2, 0.0]    # Right-front
-            ]
+        return initial_superquadrics
+    
+    def fit_multiple_superquadrics_hierarchical(self, points_for_ems):
+        """
+        Use the EXACT same hierarchical_ems function as multiquadric_test.py
+        """
+        try:
+            self.get_logger().info(f"Using EXACT COPY of multiquadric_test.py hierarchical_ems")
+            self.get_logger().info(f"Input points: {len(points_for_ems)}")
             
-            for i, offset in enumerate(offsets):
-                # Scale offset by object bounds
-                scaled_offset = np.array(offset) * points_bounds * 0.4
-                init_position = points_center + scaled_offset
-                initial_positions.append(init_position)
-                self.get_logger().info(f"  SQ {i+1}: {init_position} (offset: {offset})")
-        
-        else:
-            # For larger objects (≥ 8000 points): Use more sophisticated grid
-            # Calculate grid dimensions based on K
-            if K <= 8:
-                grid_dims = (2, 2, 2)  # 2×2×2 = 8 positions max
-            elif K <= 27:
-                grid_dims = (3, 3, 3)  # 3×3×3 = 27 positions max
-            else:
-                # For very large K, use 4×4×4 or larger
-                dim = int(np.ceil(K ** (1/3)))
-                grid_dims = (dim, dim, dim)
+            # 🔧 EXACT SAME CALL as multiquadric_test.py
+            point_seg, point_outlier, list_quadrics = self.hierarchical_ems(points_for_ems)
             
-            self.get_logger().info(f"Using {grid_dims[0]}×{grid_dims[1]}×{grid_dims[2]} grid for {K} superquadrics")
+            self.get_logger().info(f"result: {len(list_quadrics)} superquadrics")
             
-            # Generate grid positions
-            positions_generated = 0
-            for x_idx in range(grid_dims[0]):
-                for y_idx in range(grid_dims[1]):
-                    for z_idx in range(grid_dims[2]):
-                        if positions_generated >= K:
-                            break
-                        
-                        # Calculate normalized grid position [-1, 1]
-                        x_norm = (2 * x_idx / (grid_dims[0] - 1) - 1) if grid_dims[0] > 1 else 0
-                        y_norm = (2 * y_idx / (grid_dims[1] - 1) - 1) if grid_dims[1] > 1 else 0  
-                        z_norm = (2 * z_idx / (grid_dims[2] - 1) - 1) if grid_dims[2] > 1 else 0
-                        
-                        # Scale by object bounds with some margin
-                        offset_scale = 0.3  # 30% of object size as maximum offset
-                        x_offset = x_norm * points_bounds[0] * offset_scale
-                        y_offset = y_norm * points_bounds[1] * offset_scale
-                        z_offset = z_norm * points_bounds[2] * offset_scale
-                        
-                        init_position = points_center + np.array([x_offset, y_offset, z_offset])
-                        initial_positions.append(init_position)
-                        
-                        self.get_logger().info(f"  SQ {positions_generated+1}: {init_position} "
-                                            f"(grid: {x_idx},{y_idx},{z_idx})")
-                        
-                        positions_generated += 1
-                        
-                    if positions_generated >= K:
-                        break
-                if positions_generated >= K:
-                    break
-        
-        # Add one additional superquadric at the exact center (the "+1" in "6+1")
-        if len(initial_positions) < K:
-            initial_positions.append(points_center.copy())
-            self.get_logger().info(f"  SQ {len(initial_positions)}: {points_center} (center)")
-        
-        self.get_logger().info(f"Generated {len(initial_positions)} initial positions for K={K}")
-        return initial_positions[:K]  # Ensure we return exactly K positions
-
+            if not list_quadrics:
+                self.get_logger().warn("No superquadrics generated")
+                return None, []
+            
+            # Return best (first) and all superquadrics
+            best_sq = list_quadrics[0]
+            return best_sq, list_quadrics
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in exact copy hierarchical EMS: {e}")
+            self.get_logger().error(traceback.format_exc())
+            return None, []
+            
+            # Return best (first) and all superquadrics
+            best_sq = list_quadrics[0]
+            return best_sq, list_quadrics
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in exact match hierarchical EMS: {e}")
+            return None, []
+    
     def fit_multiple_superquadrics_ensemble(self, points_for_ems, K=None):
         """
         Fit multiple superquadrics using ensemble approach
@@ -808,9 +859,13 @@ class ZedGpuNode(Node):
 
         self.get_logger().info(f"Fitting {K} superquadrics using ensemble approach")
 
-        #######
-        K = 1
-        #######
+        ##########################
+        # For simplicity, we will use K=6 for now
+        # In practice, you would call self.calculate_k_superquadrics(len(points_for_ems)) to get K
+        # But for testing, we will set K=6
+        K = 6
+        ##########################
+        
         initial_positions = self.initialize_multiple_superquadrics(points_for_ems, K)
         
         fitted_superquadrics = []
@@ -822,9 +877,13 @@ class ZedGpuNode(Node):
         
         self.get_logger().info(f"Initial scale estimate: {initial_scale}")
         
-        for i, init_pos in enumerate(initial_positions):
+        for i, init_dict in enumerate(initial_positions):  # 🔧 FIX: renamed from init_pos to init_dict
             try:
-                self.get_logger().info(f"Fitting superquadric {i+1}/{K} at position {init_pos}")
+                # 🔧 FIX: Extract the center position from the dictionary
+                init_pos = init_dict['center']
+                init_type = init_dict['type']
+                
+                self.get_logger().info(f"Fitting superquadric {i+1}/{len(initial_positions)} ({init_type}) at position {init_pos}")
 
                 # ADAPTIVE PARAMETERS: Vary parameters to encourage diversity
                 parameter_variations = [
@@ -837,7 +896,7 @@ class ZedGpuNode(Node):
                 params = parameter_variations[i % len(parameter_variations)]
                 
                 #   CRITICAL: Pre-translate points to superquadric-centered coordinates
-                translated_points = points_for_ems - init_pos
+                translated_points = points_for_ems - init_pos  # 🔧 FIX: Now init_pos is a numpy array
                 
                 # Fit superquadric to translated points
                 sq_candidate, probabilities = EMS_recovery(
@@ -899,13 +958,13 @@ class ZedGpuNode(Node):
                     if sq is not None and score > 0.1]
         
         if not valid_fits:
-            self.get_logger().error(f"All {K} multi-superquadric fits failed")
+            self.get_logger().error(f"All {len(initial_positions)} multi-superquadric fits failed")
             return None, []
         
         # Sort by score (best first)
         valid_fits.sort(key=lambda x: x[1], reverse=True)
         
-        self.get_logger().info(f"Multi-superquadric fitting results (K={K}):")
+        self.get_logger().info(f"Multi-superquadric fitting results (K={len(initial_positions)}):")
         for i, (sq, score) in enumerate(valid_fits[:min(5, len(valid_fits))]):  # Show top 5
             self.get_logger().info(f"  Rank {i+1}: Score={score:.3f}, "
                                 f"Scale={sq.scale}, Center={sq.translation}")
@@ -916,25 +975,157 @@ class ZedGpuNode(Node):
         
         self.get_logger().info(f"Selected best superquadric from ensemble of {len(all_valid_sqs)} valid fits")
         return best_sq, all_valid_sqs
+    
+    def compare_superquadric_methods(self, points_for_ems):
+        """
+        Compare both superquadric fitting methods side by side
+        """
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("COMPARING SUPERQUADRIC FITTING METHODS")
+        self.get_logger().info("=" * 60)
+        
+        results = {}
+        
+        # Method 1: K-means ensemble (original paper)
+        self.get_logger().info("METHOD 1: K-means Ensemble (Original Paper)")
+        self.get_logger().info("-" * 40)
+        start_time = time.time()
+        
+        try:
+            best_sq_kmeans, all_sqs_kmeans = self.fit_multiple_superquadrics_ensemble(points_for_ems)
+            kmeans_time = time.time() - start_time
+            
+            results['kmeans'] = {
+                'best_sq': best_sq_kmeans,
+                'all_sqs': all_sqs_kmeans,
+                'count': len(all_sqs_kmeans) if all_sqs_kmeans else 0,
+                'time': kmeans_time,
+                'success': best_sq_kmeans is not None
+            }
+            
+            self.get_logger().info(f"K-means method: {results['kmeans']['count']} superquadrics "
+                                f"in {kmeans_time:.2f}s")
+            
+        except Exception as e:
+            self.get_logger().error(f"K-means method failed: {e}")
+            results['kmeans'] = {'success': False, 'count': 0, 'time': 0}
+        
+        # Method 2: Hierarchical (Liu et al.)
+        self.get_logger().info("\nMETHOD 2: Hierarchical (Liu et al.)")
+        self.get_logger().info("-" * 40)
+        start_time = time.time()
+        
+        try:
+            best_sq_hierarchical, all_sqs_hierarchical = self.fit_multiple_superquadrics_hierarchical(points_for_ems)
+            hierarchical_time = time.time() - start_time
+            
+            results['hierarchical'] = {
+                'best_sq': best_sq_hierarchical,
+                'all_sqs': all_sqs_hierarchical,
+                'count': len(all_sqs_hierarchical) if all_sqs_hierarchical else 0,
+                'time': hierarchical_time,
+                'success': best_sq_hierarchical is not None
+            }
+            
+            self.get_logger().info(f"Hierarchical method: {results['hierarchical']['count']} superquadrics "
+                                f"in {hierarchical_time:.2f}s")
+            
+        except Exception as e:
+            self.get_logger().error(f"Hierarchical method failed: {e}")
+            results['hierarchical'] = {'success': False, 'count': 0, 'time': 0}
+        
+        # Comparison summary
+        self.get_logger().info("\nCOMPARISON SUMMARY")
+        self.get_logger().info("-" * 40)
+        
+        for method_name, result in results.items():
+            if result['success']:
+                self.get_logger().info(f"{method_name.upper()}: "
+                                    f"{result['count']} SQs, "
+                                    f"{result['time']:.2f}s")
+            else:
+                self.get_logger().info(f"{method_name.upper()}: FAILED")
+        
+        # Visualize both methods if enabled
+        if self.visualize:
+            for method_name, result in results.items():
+                if result['success'] and result['all_sqs']:
+                    self.get_logger().info(f"\nVisualizing {method_name} method results...")
+                    
+                    try:
+                        # Create method-specific visualization
+                        pcd = o3d.geometry.PointCloud()
+                        pcd.points = o3d.utility.Vector3dVector(points_for_ems)
+                        pcd.paint_uniform_color([0.7, 0.7, 0.7])
+                        geometries = [pcd]
+                        
+                        # Add superquadric meshes with different colors
+                        colors = [[1,0,0], [0,1,0], [0,0,1], [1,1,0], [1,0,1], [0,1,1], [1,0.5,0], [0.5,0,1]]
+                        
+                        for i, sq in enumerate(result['all_sqs']):
+                            try:
+                                sq_mesh = self.superquadric_to_open3d_mesh(sq, arclength=0.15)
+                                if sq_mesh is not None:
+                                    color = colors[i % len(colors)]
+                                    sq_mesh.paint_uniform_color(color)
+                                    geometries.append(sq_mesh)
+                            except Exception as mesh_error:
+                                self.get_logger().warn(f"Failed to create mesh for SQ {i+1}: {mesh_error}")
+                        
+                        # Add coordinate frame
+                        coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.03)
+                        coord_frame.translate(np.mean(points_for_ems, axis=0))
+                        geometries.append(coord_frame)
+                        
+                        # Show visualization
+                        o3d.visualization.draw_geometries(
+                            geometries,
+                            window_name=f"{method_name.upper()} Method ({result['count']} SQs, {result['time']:.2f}s)",
+                            zoom=0.7,
+                            front=[0, -1, 0],
+                            lookat=np.mean(points_for_ems, axis=0),
+                            up=[0, 0, 1]
+                        )
+                        
+                    except Exception as viz_error:
+                        self.get_logger().error(f"Visualization error for {method_name}: {viz_error}")
+        
+        # Return the best result (prefer method with more superquadrics if both succeed)
+        if results['kmeans']['success'] and results['hierarchical']['success']:
+            if results['hierarchical']['count'] > results['kmeans']['count']:
+                self.get_logger().info("WINNER: Hierarchical method (more superquadrics)")
+                return results['hierarchical']['best_sq'], results['hierarchical']['all_sqs']
+            else:
+                self.get_logger().info("WINNER: K-means method (more or equal superquadrics)")
+                return results['kmeans']['best_sq'], results['kmeans']['all_sqs']
+        elif results['hierarchical']['success']:
+            self.get_logger().info("WINNER: Hierarchical method (only successful)")
+            return results['hierarchical']['best_sq'], results['hierarchical']['all_sqs']
+        elif results['kmeans']['success']:
+            self.get_logger().info("WINNER: K-means method (only successful)")
+            return results['kmeans']['best_sq'], results['kmeans']['all_sqs']
+        else:
+            self.get_logger().error("BOTH METHODS FAILED")
+            return None, []
 
     def hierarchical_ems(
         self,
         point,
-        OutlierRatio=0.9,           # prior outlier probability [0, 1) (default: 0.1)
+        OutlierRatio=0.95,           # prior outlier probability [0, 1) (default: 0.1)
         MaxIterationEM=20,           # maximum number of EM iterations (default: 20)
         ToleranceEM=1e-3,            # absolute tolerance of EM (default: 1e-3)
         RelativeToleranceEM=2e-1,    # relative tolerance of EM (default: 1e-1)
         MaxOptiIterations=2,         # maximum number of optimization iterations per M (default: 2)
-        Sigma=0.3,                   # initial sigma^2 (default: 0 - auto generate)
+        Sigma=0.1,                   # initial sigma^2 (default: 0 - auto generate)
         MaxiSwitch=2,                # maximum number of switches allowed (default: 2)
         AdaptiveUpperBound=True,    # Introduce adaptive upper bound to restrict the volume of SQ (default: false)
         Rescale=False,                # normalize the input point cloud (default: true)
-        MaxLayer=5,                  # maximum depth
-        Eps=1.7,                    # IMPORTANT: varies based on the size of the input pointcloud (DBScan parameter)
-        MinPoints=60,               # DBScan parameter required minimum points
+        MaxLayer=7,                  # maximum depth
+        Eps=0.8,                    # IMPORTANT: varies based on the size of the input pointcloud (DBScan parameter)
+        MinPoints=100,               # DBScan parameter required minimum points
     ):
         """
-        Hierarchical EMS for multiple superquadrics recovery
+        hierarchical_ems
         """
         from sklearn.cluster import DBSCAN
         
@@ -946,13 +1137,9 @@ class ZedGpuNode(Node):
         
         for h in range(MaxLayer):
             for c in range(len(point_seg[h])):
-                if len(point_seg[h][c]) < MinPoints:  # Skip if too few points
-                    continue
-                    
-                self.get_logger().info(f"Processing quadric {quadric_count} at layer {h}/{MaxLayer}")
+                self.get_logger().info(f"Counting number of generated quadrics: {quadric_count}")
                 quadric_count += 1
                 
-                # Run EMS on current point segment
                 x_raw, p_raw = EMS_recovery(
                     point_seg[h][c],
                     OutlierRatio,
@@ -971,35 +1158,19 @@ class ZedGpuNode(Node):
                 outlier = point_seg[h][c][p_raw < 0.1, :]
                 point_seg[h][c] = point_seg[h][c][p_raw > 0.1, :]
                 
-                # Check if we need to continue decomposition
-                inlier_sum = np.sum(p_raw > 0.1)
-                inlier_ratio = inlier_sum / len(point_previous)
-                self.get_logger().info(f"Layer {h}, Quadric {quadric_count-1}: Inlier ratio = {inlier_ratio:.3f}")
-                
-                # Continue decomposition if inlier ratio is low and we have enough outliers
-                if inlier_sum < (0.8 * len(point_previous)) and len(outlier) > MinPoints and h < MaxLayer - 1:
-                    # Cluster outliers using DBSCAN
+                # 🔧 EXACT CONDITION: np.sum(p_raw) vs np.sum(p_raw > 0.1)
+                if np.sum(p_raw) < (0.8 * len(point_previous)):
                     clustering = DBSCAN(eps=Eps, min_samples=MinPoints).fit(outlier)
                     labels = list(set(clustering.labels_))
                     labels = [item for item in labels if item >= 0]
                     
-                    self.get_logger().info(f"DBSCAN found {len(labels)} clusters in outliers")
-                    
                     if len(labels) >= 1:
                         for i in range(len(labels)):
-                            cluster_points = outlier[clustering.labels_ == i]
-                            if len(cluster_points) >= MinPoints:
-                                point_seg[h + 1].append(cluster_points)
-                                self.get_logger().info(f"Added cluster {i} with {len(cluster_points)} points to layer {h+1}")
-                        point_outlier[h].append(outlier[clustering.labels_ == -1])
-                    else:
-                        point_outlier[h].append(outlier)
+                            point_seg[h + 1].append(outlier[clustering.labels_ == i])
+                    point_outlier[h].append(outlier[clustering.labels_ == -1])
                 else:
                     point_outlier[h].append(outlier)
-                    if inlier_ratio >= 0.8:
-                        self.get_logger().info(f"Good fit achieved (inlier ratio: {inlier_ratio:.3f}), stopping decomposition")
         
-        self.get_logger().info(f"Hierarchical EMS completed: {len(list_quadrics)} superquadrics found")
         return point_seg, point_outlier, list_quadrics
 
     def adaptive_hierarchical_ems(self, point, OutlierRatio=0.9, MaxIterationEM=20, ToleranceEM=1e-3, 
@@ -1190,10 +1361,27 @@ class ZedGpuNode(Node):
             object_pcd = o3d.geometry.PointCloud()
             object_pcd.points = o3d.utility.Vector3dVector(object_points)
             object_pcd = self.preprocess_point_cloud(object_pcd)
-            object_pcd = object_pcd.remove_statistical_outlier(
-                nb_neighbors=100, std_ratio=0.5)[0]
+            # object_pcd = object_pcd.remove_statistical_outlier(
+            #     nb_neighbors=100, std_ratio=0.5)[0]
             object_points = np.asarray(object_pcd.points)
-                
+            
+            ####################################    
+            import os
+            import time   
+            # Create a directory for saving point clouds
+            pointcloud_dir = "/home/chris/franka_ros2_ws/src/zed_pose_estimation/pointclouds"
+            os.makedirs(pointcloud_dir, exist_ok=True)
+            
+            # Create filename with timestamp and class info
+            timestamp = int(time.time())
+            object_name = self.class_names.get(class_id, f'Class_{class_id}')
+            filename = f"object_{object_name}_class{class_id}_{timestamp}.ply"
+            filepath = os.path.join(pointcloud_dir, filename)
+
+            # Save the detected object points
+            o3d.io.write_point_cloud(filepath, object_pcd)
+            self.get_logger().info(f"Saved object point cloud to: {filepath}")
+            ###################################
 
             # Get object center from detected points
             object_center = np.mean(object_points, axis=0)
@@ -1248,11 +1436,6 @@ class ZedGpuNode(Node):
                     cropped_workspace.points = o3d.utility.Vector3dVector(filtered_points)
                     self.get_logger().info(f"Filtered points above table (z > {table_threshold:.3f}): "
                                         f"{len(filtered_points)} points")
-                
-            # Preprocess the cropped cloud
-            # cropped_workspace = cropped_workspace.remove_statistical_outlier(nb_neighbors=50, std_ratio=0.8)[0]
-            # cropped_workspace = cropped_workspace.voxel_down_sample(voxel_size=self.voxel_size)
-            # cropped_workspace = self.preprocess_point_cloud(cropped_workspace)
             
             # Save the cropped object points to temporary file for EMS processing
             temp_file = f"/tmp/object_points_{class_id}_{int(time.time())}.ply"
@@ -1278,8 +1461,8 @@ class ZedGpuNode(Node):
                 coord_frame.translate(object_center)
                 
                 o3d.visualization.draw_geometries(
-                    [detected_cloud, cropped_workspace_vis, coord_frame],
-                    window_name=f"Cropped Workspace (Blue) - Class {class_id}",
+                    [detected_cloud, coord_frame],
+                    window_name=f"Detected Points (Red) - Class {class_id}",
                     zoom=0.7, front=[0, -1, 0], lookat=object_center, up=[0, 0, 1]
                 )
                 
@@ -1291,11 +1474,18 @@ class ZedGpuNode(Node):
             # Fit superquadric using EMS on the cropped workspace
             self.get_logger().info("Fitting superquadric to cropped workspace points...")
             
-            # # Load points for EMS (it expects numpy array)
-            points_for_ems = np.asarray(cropped_workspace.points)  # Use cropped workspace
             
+            # Load points for EMS (it expects numpy array)
+            points_for_ems = np.asarray(object_pcd.points)  # Use detected cloud
+
             # Fit multiple superquadrics using paper's K calculation
-            best_sq, all_valid_sqs = self.fit_multiple_superquadrics_ensemble(points_for_ems)
+            # best_sq, all_valid_sqs = self.compare_superquadric_methods(points_for_ems)
+            best_sq, all_valid_sqs = self.fit_multiple_superquadrics_hierarchical(points_for_ems)
+            
+            if self.visualize:
+                self.visualize_hierarchical_multiquadric_fit(
+                    points_for_ems, all_valid_sqs
+                )
 
             if best_sq is None:
                 self.get_logger().error("Multi-superquadric fitting failed")
@@ -1307,6 +1497,7 @@ class ZedGpuNode(Node):
             # Generate grasps from ALL superquadrics
             all_grasp_poses = []
             all_sq_info = []
+            all_visualization_grasps = []  # 🔧 NEW: Store ALL grasps for visualization
             
             for i, sq_recovered in enumerate(all_valid_sqs):
                 try:
@@ -1316,16 +1507,7 @@ class ZedGpuNode(Node):
                     
                     consistent_euler = R_simple.from_matrix(sq_recovered.RotM).as_euler('xyz')
 
-                    # Around line 1420, replace this:
-                    sq_grasp_poses = self.grasp_planner.plan_grasps(
-                        temp_file,
-                        sq_recovered.shape,
-                        sq_recovered.scale,
-                        consistent_euler,        
-                        sq_recovered.translation
-                    )
-
-                    # With this:
+                    # Get scored/ranked grasps for execution
                     sq_grasp_data = self.grasp_planner.plan_grasps(
                         temp_file,
                         sq_recovered.shape,
@@ -1333,32 +1515,73 @@ class ZedGpuNode(Node):
                         consistent_euler,        
                         sq_recovered.translation
                     )
+                    
+                    # 🔧 Get ALL valid grasps for visualization
+                    all_grasp_data = self.grasp_planner.get_all_valid_grasps(
+                        temp_file,
+                        sq_recovered.shape,
+                        sq_recovered.scale,
+                        consistent_euler,
+                        sq_recovered.translation
+                    )
+                    
+                    # 🔧 Store all grasps with their SQ info for visualization
+                    for grasp_data in all_grasp_data:
+                        all_visualization_grasps.append(grasp_data['pose'])
+                        # Create visualization info (different from execution info)
+                        vis_info = {
+                            'sq_index': i,
+                            'sq': sq_recovered,
+                            'euler': consistent_euler,
+                            'grasp_score': grasp_data.get('score', 0.0),
+                            'is_visualization': True  # Mark as visualization data
+                        }
+                        all_sq_info.append(vis_info)
+                    
+                    self.get_logger().info(f"  SQ {i+1}: Generated {len(all_grasp_data)} total grasps for visualization")
 
-                    # Extract poses and scores from the enhanced return data
+                    # Extract poses and scores from the SCORED return data (for execution)
                     if sq_grasp_data and len(sq_grasp_data) > 0:
                         sq_grasp_poses = [data['pose'] for data in sq_grasp_data]
                         sq_grasp_scores = [data['score'] for data in sq_grasp_data]
                         
-                        self.get_logger().info(f"  SQ {i+1}: Generated {len(sq_grasp_poses)} grasps with scores")
+                        self.get_logger().info(f"  SQ {i+1}: Generated {len(sq_grasp_poses)} ranked grasps for execution")
                         for j, (pose, score) in enumerate(zip(sq_grasp_poses, sq_grasp_scores)):
-                            self.get_logger().info(f"    Grasp {j+1}: score = {score:.8f}")
+                            self.get_logger().info(f"    Execution Grasp {j+1}: score = {score:.8f}")
                         
-                        # Add grasp poses with superquadric info AND scores
+                        # Add execution grasps with superquadric info AND scores
                         for pose, score in zip(sq_grasp_poses, sq_grasp_scores):
                             all_grasp_poses.append(pose)
-                            all_sq_info.append({
+                            # Create separate execution info
+                            exec_info = {
                                 'sq_index': i,
                                 'sq': sq_recovered,
                                 'euler': consistent_euler,
-                                'grasp_score': score  # Add the actual grasp score
-                            })
+                                'grasp_score': score,
+                                'is_visualization': False  # Mark as execution data
+                            }
+                            # Note: We're using a separate list for execution, but reusing all_sq_info
+                            # You might want to create a separate all_execution_info list
                     else:
-                        self.get_logger().warn(f"  SQ {i+1}: No valid grasps generated")
-                        sq_grasp_poses = []
-                        sq_grasp_scores = []
+                        self.get_logger().warn(f"  SQ {i+1}: No valid execution grasps generated")
                         
                 except Exception as sq_error:
                     self.get_logger().error(f"Error generating grasps from SQ {i+1}: {sq_error}")
+
+            # 🔧 PROPER VISUALIZATION: Call once with ALL data
+            if self.visualize and all_visualization_grasps:
+                self.get_logger().info(f"Visualizing ALL grasps: {len(all_visualization_grasps)} grasps from {len(all_valid_sqs)} superquadrics")
+                
+                try:
+                    self.visualize_multi_superquadric_grasps(
+                        points_for_ems,
+                        all_valid_sqs,           # All superquadrics
+                        all_visualization_grasps, # ALL grasp poses (not just top-ranked)
+                        all_sq_info             # Info for all grasps
+                    )
+                except Exception as viz_error:
+                    self.get_logger().error(f"Visualization error: {viz_error}")
+            #         self.get_logger().error(traceback.format_exc())
             
             if not all_grasp_poses:
                 self.get_logger().error("No grasps generated from any superquadric")
@@ -1465,6 +1688,18 @@ class ZedGpuNode(Node):
         """Visualize all superquadrics and their corresponding grasps"""
         try:
             import open3d as o3d
+            
+            # Ensure points_for_ems is a proper numpy array with correct dtype
+            if not isinstance(points_for_ems, np.ndarray):
+                points_for_ems = np.array(points_for_ems)
+            
+            # Ensure correct shape and dtype
+            if points_for_ems.ndim != 2 or points_for_ems.shape[1] != 3:
+                self.get_logger().error(f"Invalid point cloud shape: {points_for_ems.shape}, expected (N, 3)")
+                return
+                
+            # Ensure float64 dtype (Open3D prefers this)
+            points_for_ems = points_for_ems.astype(np.float64)
             
             # Create point cloud
             pcd = o3d.geometry.PointCloud()
