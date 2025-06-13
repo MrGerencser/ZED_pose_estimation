@@ -17,19 +17,18 @@ from std_msgs.msg import Header
 from rclpy.executors import MultiThreadedExecutor
 import sensor_msgs_py.point_cloud2 as pc2
 from ultralytics import YOLO
-from zed_pose_estimation.grasp_pose_utils import *
 from zed_pose_estimation.vision_pipeline_utils import crop_point_cloud_gpu, fuse_point_clouds_centroid, subtract_point_clouds_gpu, convert_mask_to_3d_points, downsample_point_cloud_gpu
 import open3d as o3d
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from tf2_ros import TransformBroadcaster
 from scipy.spatial.transform import Rotation as R_simple
-from scipy.spatial.transform import Rotation
 from scipy.spatial import KDTree
+from sklearn.cluster import KMeans
 import traceback
 
 from zed_pose_estimation.vis2 import visualize_superquadric_grasps
 
-# Add superquadric fitting imports
+# superquadric fitting imports
 from EMS.EMS_recovery import EMS_recovery
 from zed_pose_estimation.superquadric_grasp_planner import SuperquadricGraspPlanner
 
@@ -54,9 +53,9 @@ class ZedGpuNode(Node):
         
         # Superquadric parameters
         self.declare_parameter('superquadric_enabled', True)
-        self.declare_parameter('gripper_jaw_length', 0.061)  # meters
+        self.declare_parameter('gripper_jaw_length', 0.041)  # meters
         self.declare_parameter('gripper_max_opening', 0.08)   # meters
-        self.declare_parameter('outlier_ratio', 0.2)         # EMS parameter
+        self.declare_parameter('outlier_ratio', 0.9)         # EMS parameter
         self.declare_parameter('publish_tf', True)
         self.declare_parameter('visualize', True)
         
@@ -155,8 +154,8 @@ class ZedGpuNode(Node):
         # Set the initialization parameters for camera 1
         init_params1 = sl.InitParameters()
         init_params1.set_from_serial_number(self.camera1_sn)
-        init_params1.camera_resolution = sl.RESOLUTION.HD720
-        init_params1.camera_fps = 15
+        init_params1.camera_resolution = sl.RESOLUTION.HD2K
+        init_params1.camera_fps = 10
         init_params1.depth_mode = sl.DEPTH_MODE.NEURAL
         init_params1.depth_minimum_distance = 0.4
         init_params1.coordinate_units = sl.UNIT.METER
@@ -164,8 +163,8 @@ class ZedGpuNode(Node):
         # Set the initialization parameters for camera 2
         init_params2 = sl.InitParameters()
         init_params2.set_from_serial_number(self.camera2_sn)
-        init_params2.camera_resolution = sl.RESOLUTION.HD720
-        init_params2.camera_fps = 15
+        init_params2.camera_resolution = sl.RESOLUTION.HD2K
+        init_params2.camera_fps = 10
         init_params2.depth_mode = sl.DEPTH_MODE.NEURAL
         init_params2.depth_minimum_distance = 0.4
         init_params2.coordinate_units = sl.UNIT.METER
@@ -281,12 +280,11 @@ class ZedGpuNode(Node):
             if frame1 is None or frame2 is None:
                 return
         
-
             # Step 2: Retrieve and process depth maps
             depth_np1, depth_np2 = self._retrieve_depth_maps()
             if depth_np1 is None or depth_np2 is None:
                 return
-                
+            
             # Step 3: Process point clouds
             pc1_cropped, pc2_cropped, fused_workspace_np, pcd_fused_workspace = self._process_point_clouds()
             if pc1_cropped is None:
@@ -300,14 +298,14 @@ class ZedGpuNode(Node):
                 results1, results2, class_ids1, class_ids2, depth_np1, depth_np2
             )
 
-            # Step 7: Generate grasps using superquadric fitting
+            # Step 6: Generate grasps using superquadric fitting
             if self.superquadric_enabled and fused_object_points:
                 self._process_superquadric_grasps(fused_object_points, fused_object_classes, fused_workspace_np)
             
-            # Step 8: Publish point clouds
+            # Step 7: Publish point clouds
             self._publish_point_clouds(fused_workspace_np, fused_objects_np)
             
-            # Step 9: Update visualization and FPS
+            # Step 8: Update visualization and FPS
             self._update_visualization_and_fps(frame1, frame2, results1, results2, start_time)
             
         except Exception as e:
@@ -418,8 +416,8 @@ class ZedGpuNode(Node):
             pcd_fused_workspace.points = o3d.utility.Vector3dVector(fused_workspace_np)
             
             # Optional visualization
-            if self.visualize:
-                o3d.visualization.draw_geometries([pcd_fused_workspace], window_name="Fused Workspace Point Cloud")
+            # if self.visualize:
+            #     o3d.visualization.draw_geometries([pcd_fused_workspace], window_name="Fused Workspace Point Cloud")
             
             pc_time = time.time() - pc_start
             self.timings["Point Cloud Processing"].append(pc_time)
@@ -588,32 +586,14 @@ class ZedGpuNode(Node):
             pos = best_grasp[:3, 3]  # Extract translation
             rot_matrix = best_grasp[:3, :3]  # Extract rotation matrix
             
-            # Convert rotation matrix to quaternion
-            from scipy.spatial.transform import Rotation as R_scipy
-            quat = R_scipy.from_matrix(rot_matrix).as_quat()  # Returns [x, y, z, w]
-            euler = R_scipy.from_matrix(rot_matrix).as_euler('xyz')
+            # Convert rotation matrix to quaternion directly - NO EXTRA TRANSFORMATION NEEDED
+            quat = R_simple.from_matrix(rot_matrix).as_quat()  # Returns [x, y, z, w]
+            euler = R_simple.from_matrix(rot_matrix).as_euler('xyz')
             
             print(f"Best grasp position: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
             print(f"Best grasp euler angles: [{euler[0]:.3f}, {euler[1]:.3f}, {euler[2]:.3f}]")
             print(f"Best grasp quaternion: [{quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f}]")
             
-            # Convert to end-effector frame
-            franka_home_euler = np.array([np.pi, 0.0, 0.0])  # Home position euler angles
-            euler_diff = euler - franka_home_euler
-
-            franka_home_rotation = R_scipy.from_euler('xyz', franka_home_euler)
-            best_grasp_rotation = R_scipy.from_matrix(rot_matrix)
-            best_grasp_rotation_ee = franka_home_rotation.inv() * best_grasp_rotation
-
-            print(f"Best grasp rotation in EE frame: {best_grasp_rotation_ee.as_euler('xyz')}")
-            quat_ee = best_grasp_rotation_ee.as_quat()  # Convert to quaternion in EE frame
-
-            # Visualization
-            if self.visualize and sq_recovered is not None:
-                consistent_euler = R_scipy.from_matrix(sq_recovered.RotM).as_euler('xyz')
-                # Use object points for visualization (you'll need to pass this from the calling function)
-                # For now, we'll skip the detailed visualization in this refactored version
-                
             # Create and publish pose message
             pose_msg = PoseStamped()
             pose_msg.header = Header()
@@ -622,24 +602,15 @@ class ZedGpuNode(Node):
             pose_msg.pose.position.x = float(pos[0])
             pose_msg.pose.position.y = float(pos[1])
             pose_msg.pose.position.z = float(pos[2]) + 0.01  # Slight offset to avoid collision
-            pose_msg.pose.orientation.x = float(quat_ee[0])
-            pose_msg.pose.orientation.y = float(quat_ee[1])
-            pose_msg.pose.orientation.z = float(quat_ee[2])
-            pose_msg.pose.orientation.w = float(quat_ee[3])
+            pose_msg.pose.orientation.x = float(quat[0])
+            pose_msg.pose.orientation.y = float(quat[1])
+            pose_msg.pose.orientation.z = float(quat[2])
+            pose_msg.pose.orientation.w = float(quat[3])
 
             # Publish the grasp pose
             self.pose_publisher.publish(pose_msg)
             self.get_logger().info(f"Published grasp pose at: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
-            
-            # Optionally publish TF transform as well
-            if self.publish_tf:
-                self.publish_transform(
-                    position=pos,
-                    quaternion=quat,
-                    parent_frame=self.target_frame,
-                    child_frame=f"object_{class_id}_grasp"
-                )
-                
+                    
         except Exception as e:
             self.get_logger().error(f"Error publishing grasp pose: {e}")
 
@@ -662,6 +633,80 @@ class ZedGpuNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error publishing point clouds: {e}")
 
+    def visualize_hierarchical_multiquadric_fit(self, object_points, list_quadrics):
+        """Enhanced visualization for hierarchical multiquadric fitting"""
+        try:
+            import random
+            
+            # Create point cloud from original points
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(object_points)
+            pcd.paint_uniform_color([0.5, 0.5, 0.5])  # Gray for original points
+            
+            # Create list of geometries to visualize
+            geometries = [pcd]
+            
+            # Generate distinct colors for each quadric
+            colors = []
+            for i in range(len(list_quadrics)):
+                # Use HSV color space for better color distribution
+                hue = (i * 137.5) % 360  # Golden angle for good distribution
+                saturation = 0.8
+                value = 0.9
+                # Convert HSV to RGB
+                import colorsys
+                rgb = colorsys.hsv_to_rgb(hue/360.0, saturation, value)
+                colors.append(list(rgb))
+            
+            # Add each superquadric mesh with different colors
+            successful_quadrics = 0
+            for i, quadric in enumerate(list_quadrics):
+                try:
+                    sq_mesh = self.superquadric_to_open3d_mesh(quadric, arclength=0.15)
+                    if sq_mesh is not None:
+                        sq_mesh.paint_uniform_color(colors[i])
+                        geometries.append(sq_mesh)
+                        successful_quadrics += 1
+                        
+                        # Log quadric parameters
+                        self.get_logger().info(f"Quadric {i+1}: shape=({quadric.shape[0]:.3f}, {quadric.shape[1]:.3f}), "
+                                            f"scale=({quadric.scale[0]:.3f}, {quadric.scale[1]:.3f}, {quadric.scale[2]:.3f})")
+                except Exception as mesh_error:
+                    self.get_logger().warn(f"Failed to create mesh for quadric {i+1}: {mesh_error}")
+            
+            # Save visualization files
+            timestamp = int(time.time())
+            os.makedirs("pointclouds", exist_ok=True)
+            # o3d.io.write_point_cloud(f"pointclouds/adaptive_multiquadric_original_{timestamp}.ply", pcd)
+            
+            # for i, geom in enumerate(geometries[1:]):  # Skip original point cloud
+            #     if hasattr(geom, 'triangles'):  # Check if it's a mesh
+            #         o3d.io.write_triangle_mesh(f"pointclouds/adaptive_sq_{i+1}_{timestamp}.ply", geom)
+            
+            self.get_logger().info(f"Adaptive multiquadric fitting: {successful_quadrics}/{len(list_quadrics)} successful meshes")
+            
+            # Add coordinate frame
+            coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
+            geometries.append(coord_frame)
+            
+            # Visualize all geometries together
+            if self.visualize:
+                o3d.visualization.draw_geometries(
+                    geometries,
+                    window_name=f"Adaptive Multi-Superquadric Fitting (K={len(list_quadrics)})",
+                    zoom=0.7,
+                    front=[0, -1, 0],
+                    lookat=pcd.get_center(),
+                    up=[0, 0, 1]
+                )
+            
+            return successful_quadrics
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in adaptive multiquadric visualization: {e}")
+            self.get_logger().error(traceback.format_exc())
+            return 0
+    
     def _update_visualization_and_fps(self, frame1, frame2, results1, results2, start_time):
         """Update visualization display and calculate FPS"""
         try:
@@ -774,535 +819,390 @@ class ZedGpuNode(Node):
         return K
 
     def initialize_multiple_superquadrics(self, points_for_ems, K=None):
-        """
-        Initialize K+1 superquadrics using the paper's exact method:
-        - K-means clustering into K subsets
-        - Each SQ initialized as ellipsoid with MoI = cluster_MoI / 2
-        - One extra SQ for the whole object
-        """
+        """Initialize K+1 superquadrics using the paper's exact method"""
         from sklearn.cluster import KMeans
         
         if K is None:
             K = self.calculate_k_superquadrics(len(points_for_ems))
         
-        # 1. K-means clustering
+        # K-means clustering
         kmeans = KMeans(n_clusters=K, random_state=42)
         cluster_labels = kmeans.fit_predict(points_for_ems)
         
         initial_superquadrics = []
         
-        # 2. Initialize K superquadrics from clusters
+        # Initialize K superquadrics from clusters
         for i in range(K):
             cluster_points = points_for_ems[cluster_labels == i]
-            if len(cluster_points) > 10:  # Ensure sufficient points
-                # Calculate moment of inertia for this cluster
-                center = np.mean(cluster_points, axis=0)
-                # Initialize SQ with MoI-based ellipsoid parameters
+            if len(cluster_points) > 10:
+                # Calculate MoI for this cluster
+                cluster_moi = self.calculate_moment_of_inertia(cluster_points)
+                
+                # Initialize ellipsoid with MoI = cluster_MoI / 2
+                ellipsoid_params = self.moi_to_ellipsoid_params(cluster_moi / 2.0)
+                
                 initial_superquadrics.append({
-                    'center': center,
-                    'points': cluster_points,
+                    'translation': np.mean(cluster_points, axis=0),
+                    'scale': ellipsoid_params['scale'],
+                    'shape': [1.0, 1.0],  # Ellipsoid shape parameters
+                    'rotation': ellipsoid_params['rotation'],
                     'type': 'cluster'
                 })
         
-        # 3. Add one extra SQ for the whole object (K+1)
-        global_center = np.mean(points_for_ems, axis=0)
+        # Add extra SQ for whole object (K+1)
+        global_moi = self.calculate_moment_of_inertia(points_for_ems)
+        global_ellipsoid = self.moi_to_ellipsoid_params(global_moi / 2.0)
+        
         initial_superquadrics.append({
-            'center': global_center,
-            'points': points_for_ems,
+            'translation': np.mean(points_for_ems, axis=0),
+            'scale': global_ellipsoid['scale'],
+            'shape': [1.0, 1.0],
+            'rotation': global_ellipsoid['rotation'],
             'type': 'global'
         })
         
         return initial_superquadrics
-    
-    def fit_multiple_superquadrics_hierarchical(self, points_for_ems):
-        """
-        Use the EXACT same hierarchical_ems function as multiquadric_test.py
-        """
+
+    def calculate_moment_of_inertia(self, points):
+        """Calculate moment of inertia tensor for point cloud"""
+        center = np.mean(points, axis=0)
+        centered_points = points - center
+        
+        # Calculate inertia tensor
+        I = np.zeros((3, 3))
+        for p in centered_points:
+            I += np.outer(p, p)
+        I /= len(points)
+        
+        return I
+
+    def moi_to_ellipsoid_params(self, inertia_tensor):
+        """Convert moment of inertia to ellipsoid parameters with proper rotation matrix"""
         try:
-            self.get_logger().info(f"Using EXACT COPY of multiquadric_test.py hierarchical_ems")
-            self.get_logger().info(f"Input points: {len(points_for_ems)}")
+            eigenvals, eigenvecs = np.linalg.eigh(inertia_tensor)
             
-            # 🔧 EXACT SAME CALL as multiquadric_test.py
-            point_seg, point_outlier, list_quadrics = self.hierarchical_ems(points_for_ems)
+            # Ensure eigenvalues are positive
+            eigenvals = np.abs(eigenvals)
+            eigenvals = np.maximum(eigenvals, 1e-12)  # Avoid zero eigenvalues
             
-            self.get_logger().info(f"result: {len(list_quadrics)} superquadrics")
+            # Scale from eigenvalues (semi-axes of ellipsoid)
+            scale = np.sqrt(eigenvals)
             
-            if not list_quadrics:
-                self.get_logger().warn("No superquadrics generated")
+            # Ensure proper rotation matrix (right-handed, determinant = +1)
+            rotation_matrix = eigenvecs.copy()
+            
+            # Check if the matrix is left-handed (negative determinant)
+            if np.linalg.det(rotation_matrix) < 0:
+                # Fix by flipping one column (usually the last one)
+                rotation_matrix[:, -1] = -rotation_matrix[:, -1]
+                self.get_logger().debug("Fixed left-handed rotation matrix by flipping last column")
+            
+            # Double-check that we now have a proper rotation matrix
+            det = np.linalg.det(rotation_matrix)
+            if abs(det - 1.0) > 1e-6:
+                self.get_logger().warn(f"Rotation matrix determinant: {det}, orthogonalizing...")
+                # Use SVD to get the closest proper rotation matrix
+                U, _, Vt = np.linalg.svd(rotation_matrix)
+                rotation_matrix = U @ Vt
+                if np.linalg.det(rotation_matrix) < 0:
+                    rotation_matrix[:, -1] = -rotation_matrix[:, -1]
+            
+            return {
+                'scale': scale,
+                'rotation': rotation_matrix
+            }
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in moi_to_ellipsoid_params: {e}")
+            # Return identity as fallback
+            return {
+                'scale': np.array([0.01, 0.01, 0.01]),
+                'rotation': np.eye(3)
+            }
+
+
+    def fit_multiple_superquadrics_ensemble(self, points_for_ems, K=None):
+        """Implement the EXACT paper methodology"""
+        
+        try:
+            # Add point cloud preprocessing and validation
+            if len(points_for_ems) < 100:
+                self.get_logger().warn(f"Too few points ({len(points_for_ems)}) for multi-superquadric fitting")
                 return None, []
             
-            # Return best (first) and all superquadrics
-            best_sq = list_quadrics[0]
-            return best_sq, list_quadrics
+            # Normalize/center the point cloud to improve numerical stability
+            points_center = np.mean(points_for_ems, axis=0)
+            points_std = np.std(points_for_ems, axis=0)
             
-        except Exception as e:
-            self.get_logger().error(f"Error in exact copy hierarchical EMS: {e}")
-            self.get_logger().error(traceback.format_exc())
-            return None, []
+            # Check for degenerate cases
+            if np.any(points_std < 1e-6):
+                self.get_logger().warn("Degenerate point cloud (very small std dev)")
+                return None, []
             
-            # Return best (first) and all superquadrics
-            best_sq = list_quadrics[0]
-            return best_sq, list_quadrics
+            self.get_logger().info(f"Point cloud stats: center={points_center}, std={points_std}")
             
-        except Exception as e:
-            self.get_logger().error(f"Error in exact match hierarchical EMS: {e}")
-            return None, []
-    
-    def fit_multiple_superquadrics_ensemble(self, points_for_ems, K=None):
-        """
-        Fit multiple superquadrics using ensemble approach
-        """
-        
-        # Calculate K using the paper's formula
-        if K is None:
-            K = self.calculate_k_superquadrics(len(points_for_ems))
+            # STEP 1: Parse point set X into K parts via K-means (EXACT as paper)
+            
+            if K is None:
+                K = self.calculate_k_superquadrics(len(points_for_ems))
+            
+            K = 1
+            self.get_logger().info(f"Using K={K} clusters")
+            
+            # K-means clustering to get {Φ1, Φ2, ..., ΦK}
+            kmeans = KMeans(n_clusters=K, random_state=42, n_init=10)
+            cluster_labels = kmeans.fit_predict(points_for_ems)
 
-        self.get_logger().info(f"Fitting {K} superquadrics using ensemble approach")
-
-        ##########################
-        # For simplicity, we will use K=6 for now
-        # In practice, you would call self.calculate_k_superquadrics(len(points_for_ems)) to get K
-        # But for testing, we will set K=6
-        K = 6
-        ##########################
-        
-        initial_positions = self.initialize_multiple_superquadrics(points_for_ems, K)
-        
-        fitted_superquadrics = []
-        fitting_scores = []
-        
-        # Initial scale estimate based on point cloud
-        points_bounds = np.max(points_for_ems, axis=0) - np.min(points_for_ems, axis=0)
-        initial_scale = points_bounds / (2.0 + K * 0.1)  # Smaller scales for more superquadrics
-        
-        self.get_logger().info(f"Initial scale estimate: {initial_scale}")
-        
-        for i, init_dict in enumerate(initial_positions):  # 🔧 FIX: renamed from init_pos to init_dict
-            try:
-                # 🔧 FIX: Extract the center position from the dictionary
-                init_pos = init_dict['center']
-                init_type = init_dict['type']
-                
-                self.get_logger().info(f"Fitting superquadric {i+1}/{len(initial_positions)} ({init_type}) at position {init_pos}")
-
-                # ADAPTIVE PARAMETERS: Vary parameters to encourage diversity
-                parameter_variations = [
-                    # Each SQ gets different parameters to explore solution space
-                    {'outlier_ratio': 0.1 + (i % 4) * 0.1, 'tolerance': 1e-3, 'sigma': 0.05},
-                    {'outlier_ratio': 0.2 + (i % 3) * 0.1, 'tolerance': 1e-2, 'sigma': 0.08},
-                    {'outlier_ratio': 0.15 + (i % 5) * 0.05, 'tolerance': 5e-3, 'sigma': 0.06},
-                ]
-                
-                params = parameter_variations[i % len(parameter_variations)]
-                
-                #   CRITICAL: Pre-translate points to superquadric-centered coordinates
-                translated_points = points_for_ems - init_pos  # 🔧 FIX: Now init_pos is a numpy array
-                
-                # Fit superquadric to translated points
-                sq_candidate, probabilities = EMS_recovery(
-                    translated_points,  # Points centered around init_pos
-                    OutlierRatio=params['outlier_ratio'],
-                    MaxIterationEM=20 + (i % 3) * 5,  # Vary iterations
-                    ToleranceEM=params['tolerance'],
-                    RelativeToleranceEM=1e-1,
-                    MaxOptiIterations=2 + (i % 2),  # Vary optimization iterations
-                    Sigma=params['sigma'],
-                    MaxiSwitch=1 + (i % 3),  # Vary switches
-                    AdaptiveUpperBound=True,
-                    Rescale=False
-                )
-                
-                #   CRITICAL: Translate superquadric back to world coordinates
-                sq_candidate.translation = sq_candidate.translation + init_pos
-                
-                # Calculate fitting quality score based on paper's criteria
-                explained_points = np.sum(probabilities > 0.5)  # Points well-explained
-                total_points = len(points_for_ems)
-                coverage_score = explained_points / total_points
-                
-                # Compactness score (prefer reasonable sizes relative to object)
-                sq_volume = np.prod(sq_candidate.scale)
-                object_volume_est = np.prod(points_bounds) * (0.2 / K)  # Each SQ should cover 1/K of object
-                compactness_score = min(1.0, object_volume_est / sq_volume) if sq_volume > 0 else 0.0
-                
-                # Shape regularity score (prefer reasonable shape parameters)
-                shape_regularity = 1.0 / (1.0 + abs(sq_candidate.shape[0] - 1.0) + abs(sq_candidate.shape[1] - 1.0))
-                
-                # Position accuracy (prefer SQs that stay near their initialization)
-                position_drift = np.linalg.norm(sq_candidate.translation - init_pos)
-                max_drift = np.linalg.norm(points_bounds) * 0.5
-                position_score = max(0.0, 1.0 - position_drift / max_drift)
-                
-                # Combined score following paper's multi-SQ objectives
-                total_score = (coverage_score * 0.4 +       # Primary: how well does it explain points
-                            compactness_score * 0.3 +     # Secondary: reasonable size
-                            shape_regularity * 0.2 +      # Tertiary: regular shape
-                            position_score * 0.1)         # Quaternary: position stability
-                
-                fitted_superquadrics.append(sq_candidate)
-                fitting_scores.append(total_score)
-                
-                self.get_logger().info(f"  SQ {i+1}: Coverage={coverage_score:.3f}, "
-                                    f"Compact={compactness_score:.3f}, "
-                                    f"Regular={shape_regularity:.3f}, "
-                                    f"Position={position_score:.3f}, "
-                                    f"Total={total_score:.3f}")
-                
-            except Exception as e:
-                self.get_logger().warn(f"Failed to fit superquadric {i+1}: {e}")
-                fitting_scores.append(0.0)
-                fitted_superquadrics.append(None)
-        
-        # Filter out failed fits
-        valid_fits = [(sq, score) for sq, score in zip(fitted_superquadrics, fitting_scores) 
-                    if sq is not None and score > 0.1]
-        
-        if not valid_fits:
-            self.get_logger().error(f"All {len(initial_positions)} multi-superquadric fits failed")
-            return None, []
-        
-        # Sort by score (best first)
-        valid_fits.sort(key=lambda x: x[1], reverse=True)
-        
-        self.get_logger().info(f"Multi-superquadric fitting results (K={len(initial_positions)}):")
-        for i, (sq, score) in enumerate(valid_fits[:min(5, len(valid_fits))]):  # Show top 5
-            self.get_logger().info(f"  Rank {i+1}: Score={score:.3f}, "
-                                f"Scale={sq.scale}, Center={sq.translation}")
-        
-        # Return best superquadric and all valid ones for comparison
-        best_sq = valid_fits[0][0]
-        all_valid_sqs = [sq for sq, score in valid_fits]
-        
-        self.get_logger().info(f"Selected best superquadric from ensemble of {len(all_valid_sqs)} valid fits")
-        return best_sq, all_valid_sqs
-    
-    def compare_superquadric_methods(self, points_for_ems):
-        """
-        Compare both superquadric fitting methods side by side
-        """
-        self.get_logger().info("=" * 60)
-        self.get_logger().info("COMPARING SUPERQUADRIC FITTING METHODS")
-        self.get_logger().info("=" * 60)
-        
-        results = {}
-        
-        # Method 1: K-means ensemble (original paper)
-        self.get_logger().info("METHOD 1: K-means Ensemble (Original Paper)")
-        self.get_logger().info("-" * 40)
-        start_time = time.time()
-        
-        try:
-            best_sq_kmeans, all_sqs_kmeans = self.fit_multiple_superquadrics_ensemble(points_for_ems)
-            kmeans_time = time.time() - start_time
+            # STEP 2: Initialize K+1 ellipsoids with improved validation
+            initial_ellipsoids = []
             
-            results['kmeans'] = {
-                'best_sq': best_sq_kmeans,
-                'all_sqs': all_sqs_kmeans,
-                'count': len(all_sqs_kmeans) if all_sqs_kmeans else 0,
-                'time': kmeans_time,
-                'success': best_sq_kmeans is not None
-            }
-            
-            self.get_logger().info(f"K-means method: {results['kmeans']['count']} superquadrics "
-                                f"in {kmeans_time:.2f}s")
-            
-        except Exception as e:
-            self.get_logger().error(f"K-means method failed: {e}")
-            results['kmeans'] = {'success': False, 'count': 0, 'time': 0}
-        
-        # Method 2: Hierarchical (Liu et al.)
-        self.get_logger().info("\nMETHOD 2: Hierarchical (Liu et al.)")
-        self.get_logger().info("-" * 40)
-        start_time = time.time()
-        
-        try:
-            best_sq_hierarchical, all_sqs_hierarchical = self.fit_multiple_superquadrics_hierarchical(points_for_ems)
-            hierarchical_time = time.time() - start_time
-            
-            results['hierarchical'] = {
-                'best_sq': best_sq_hierarchical,
-                'all_sqs': all_sqs_hierarchical,
-                'count': len(all_sqs_hierarchical) if all_sqs_hierarchical else 0,
-                'time': hierarchical_time,
-                'success': best_sq_hierarchical is not None
-            }
-            
-            self.get_logger().info(f"Hierarchical method: {results['hierarchical']['count']} superquadrics "
-                                f"in {hierarchical_time:.2f}s")
-            
-        except Exception as e:
-            self.get_logger().error(f"Hierarchical method failed: {e}")
-            results['hierarchical'] = {'success': False, 'count': 0, 'time': 0}
-        
-        # Comparison summary
-        self.get_logger().info("\nCOMPARISON SUMMARY")
-        self.get_logger().info("-" * 40)
-        
-        for method_name, result in results.items():
-            if result['success']:
-                self.get_logger().info(f"{method_name.upper()}: "
-                                    f"{result['count']} SQs, "
-                                    f"{result['time']:.2f}s")
-            else:
-                self.get_logger().info(f"{method_name.upper()}: FAILED")
-        
-        # Visualize both methods if enabled
-        if self.visualize:
-            for method_name, result in results.items():
-                if result['success'] and result['all_sqs']:
-                    self.get_logger().info(f"\nVisualizing {method_name} method results...")
-                    
-                    try:
-                        # Create method-specific visualization
-                        pcd = o3d.geometry.PointCloud()
-                        pcd.points = o3d.utility.Vector3dVector(points_for_ems)
-                        pcd.paint_uniform_color([0.7, 0.7, 0.7])
-                        geometries = [pcd]
-                        
-                        # Add superquadric meshes with different colors
-                        colors = [[1,0,0], [0,1,0], [0,0,1], [1,1,0], [1,0,1], [0,1,1], [1,0.5,0], [0.5,0,1]]
-                        
-                        for i, sq in enumerate(result['all_sqs']):
-                            try:
-                                sq_mesh = self.superquadric_to_open3d_mesh(sq, arclength=0.15)
-                                if sq_mesh is not None:
-                                    color = colors[i % len(colors)]
-                                    sq_mesh.paint_uniform_color(color)
-                                    geometries.append(sq_mesh)
-                            except Exception as mesh_error:
-                                self.get_logger().warn(f"Failed to create mesh for SQ {i+1}: {mesh_error}")
-                        
-                        # Add coordinate frame
-                        coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.03)
-                        coord_frame.translate(np.mean(points_for_ems, axis=0))
-                        geometries.append(coord_frame)
-                        
-                        # Show visualization
-                        o3d.visualization.draw_geometries(
-                            geometries,
-                            window_name=f"{method_name.upper()} Method ({result['count']} SQs, {result['time']:.2f}s)",
-                            zoom=0.7,
-                            front=[0, -1, 0],
-                            lookat=np.mean(points_for_ems, axis=0),
-                            up=[0, 0, 1]
-                        )
-                        
-                    except Exception as viz_error:
-                        self.get_logger().error(f"Visualization error for {method_name}: {viz_error}")
-        
-        # Return the best result (prefer method with more superquadrics if both succeed)
-        if results['kmeans']['success'] and results['hierarchical']['success']:
-            if results['hierarchical']['count'] > results['kmeans']['count']:
-                self.get_logger().info("WINNER: Hierarchical method (more superquadrics)")
-                return results['hierarchical']['best_sq'], results['hierarchical']['all_sqs']
-            else:
-                self.get_logger().info("WINNER: K-means method (more or equal superquadrics)")
-                return results['kmeans']['best_sq'], results['kmeans']['all_sqs']
-        elif results['hierarchical']['success']:
-            self.get_logger().info("WINNER: Hierarchical method (only successful)")
-            return results['hierarchical']['best_sq'], results['hierarchical']['all_sqs']
-        elif results['kmeans']['success']:
-            self.get_logger().info("WINNER: K-means method (only successful)")
-            return results['kmeans']['best_sq'], results['kmeans']['all_sqs']
-        else:
-            self.get_logger().error("BOTH METHODS FAILED")
-            return None, []
-
-    def hierarchical_ems(
-        self,
-        point,
-        OutlierRatio=0.95,           # prior outlier probability [0, 1) (default: 0.1)
-        MaxIterationEM=20,           # maximum number of EM iterations (default: 20)
-        ToleranceEM=1e-3,            # absolute tolerance of EM (default: 1e-3)
-        RelativeToleranceEM=2e-1,    # relative tolerance of EM (default: 1e-1)
-        MaxOptiIterations=2,         # maximum number of optimization iterations per M (default: 2)
-        Sigma=0.1,                   # initial sigma^2 (default: 0 - auto generate)
-        MaxiSwitch=2,                # maximum number of switches allowed (default: 2)
-        AdaptiveUpperBound=True,    # Introduce adaptive upper bound to restrict the volume of SQ (default: false)
-        Rescale=False,                # normalize the input point cloud (default: true)
-        MaxLayer=7,                  # maximum depth
-        Eps=0.8,                    # IMPORTANT: varies based on the size of the input pointcloud (DBScan parameter)
-        MinPoints=100,               # DBScan parameter required minimum points
-    ):
-        """
-        hierarchical_ems
-        """
-        from sklearn.cluster import DBSCAN
-        
-        point_seg = {key: [] for key in list(range(0, MaxLayer+1))}
-        point_outlier = {key: [] for key in list(range(0, MaxLayer+1))}
-        point_seg[0] = [point]
-        list_quadrics = []
-        quadric_count = 1
-        
-        for h in range(MaxLayer):
-            for c in range(len(point_seg[h])):
-                self.get_logger().info(f"Counting number of generated quadrics: {quadric_count}")
-                quadric_count += 1
+            # For each subset Φi, initialize ellipsoid θi with validation
+            for i in range(K):
+                cluster_points = points_for_ems[cluster_labels == i]
                 
-                x_raw, p_raw = EMS_recovery(
-                    point_seg[h][c],
-                    OutlierRatio,
-                    MaxIterationEM,
-                    ToleranceEM,
-                    RelativeToleranceEM,
-                    MaxOptiIterations,
-                    Sigma,
-                    MaxiSwitch,
-                    AdaptiveUpperBound,
-                    Rescale,
-                )
+                # Validate cluster size and properties
+                if len(cluster_points) < 50:  # Increased minimum threshold
+                    self.get_logger().warn(f"Cluster {i} too small ({len(cluster_points)} points), skipping")
+                    continue
                 
-                point_previous = point_seg[h][c]
-                list_quadrics.append(x_raw)
-                outlier = point_seg[h][c][p_raw < 0.1, :]
-                point_seg[h][c] = point_seg[h][c][p_raw > 0.1, :]
+                cluster_center = np.mean(cluster_points, axis=0)
+                cluster_std = np.std(cluster_points, axis=0)
                 
-                # 🔧 EXACT CONDITION: np.sum(p_raw) vs np.sum(p_raw > 0.1)
-                if np.sum(p_raw) < (0.8 * len(point_previous)):
-                    clustering = DBSCAN(eps=Eps, min_samples=MinPoints).fit(outlier)
-                    labels = list(set(clustering.labels_))
-                    labels = [item for item in labels if item >= 0]
-                    
-                    if len(labels) >= 1:
-                        for i in range(len(labels)):
-                            point_seg[h + 1].append(outlier[clustering.labels_ == i])
-                    point_outlier[h].append(outlier[clustering.labels_ == -1])
-                else:
-                    point_outlier[h].append(outlier)
-        
-        return point_seg, point_outlier, list_quadrics
-
-    def adaptive_hierarchical_ems(self, point, OutlierRatio=0.9, MaxIterationEM=20, ToleranceEM=1e-3, 
-                                RelativeToleranceEM=2e-1, MaxOptiIterations=2, Sigma=0.3, MaxiSwitch=2,
-                                AdaptiveUpperBound=True, Rescale=False):
-        """
-        Adaptive hierarchical EMS that calculates parameters based on point cloud size
-        """
-        try:
-            # Calculate adaptive parameters based on point cloud size
-            point_count = len(point)
-            
-            #   ADAPTIVE PARAMETERS: Adjust based on point cloud density
-            if point_count < 1000:
-                MaxLayer = 3
-                Eps = 0.01  # Smaller epsilon for smaller, denser objects
-                MinPoints = 30
-            elif point_count < 3000:
-                MaxLayer = 4
-                Eps = 0.015
-                MinPoints = 50
-            elif point_count < 8000:
-                MaxLayer = 5
-                Eps = 0.02
-                MinPoints = 60
-            else:
-                MaxLayer = 6
-                Eps = 0.025  # Larger epsilon for bigger, more spread out objects
-                MinPoints = 80
-            
-            self.get_logger().info(f"Adaptive parameters for {point_count} points:")
-            self.get_logger().info(f"  MaxLayer: {MaxLayer}")
-            self.get_logger().info(f"  DBSCAN Eps: {Eps}")
-            self.get_logger().info(f"  MinPoints: {MinPoints}")
-            
-            # Call the hierarchical EMS with adaptive parameters
-            return self.hierarchical_ems(
-                point=point,
-                OutlierRatio=OutlierRatio,
-                MaxIterationEM=MaxIterationEM,
-                ToleranceEM=ToleranceEM,
-                RelativeToleranceEM=RelativeToleranceEM,
-                MaxOptiIterations=MaxOptiIterations,
-                Sigma=Sigma,
-                MaxiSwitch=MaxiSwitch,
-                AdaptiveUpperBound=AdaptiveUpperBound,
-                Rescale=Rescale,
-                MaxLayer=MaxLayer,
-                Eps=Eps,
-                MinPoints=MinPoints
-            )
-            
-        except Exception as e:
-            self.get_logger().error(f"Error in adaptive hierarchical EMS: {e}")
-            return None, None, []
-
-    def visualize_hierarchical_multiquadric_fit(self, object_points, list_quadrics):
-        """Enhanced visualization for hierarchical multiquadric fitting"""
-        try:
-            import random
-            
-            # Create point cloud from original points
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(object_points)
-            pcd.paint_uniform_color([0.5, 0.5, 0.5])  # Gray for original points
-            
-            # Create list of geometries to visualize
-            geometries = [pcd]
-            
-            # Generate distinct colors for each quadric
-            colors = []
-            for i in range(len(list_quadrics)):
-                # Use HSV color space for better color distribution
-                hue = (i * 137.5) % 360  # Golden angle for good distribution
-                saturation = 0.8
-                value = 0.9
-                # Convert HSV to RGB
-                import colorsys
-                rgb = colorsys.hsv_to_rgb(hue/360.0, saturation, value)
-                colors.append(list(rgb))
-            
-            # Add each superquadric mesh with different colors
-            successful_quadrics = 0
-            for i, quadric in enumerate(list_quadrics):
+                # Check cluster validity
+                if np.any(cluster_std < 1e-6):
+                    self.get_logger().warn(f"Cluster {i} degenerate (std={cluster_std}), skipping")
+                    continue
+                
+                # In the cluster processing loop, replace the MoI calculation section:
                 try:
-                    sq_mesh = self.superquadric_to_open3d_mesh(quadric, arclength=0.15)
-                    if sq_mesh is not None:
-                        sq_mesh.paint_uniform_color(colors[i])
-                        geometries.append(sq_mesh)
-                        successful_quadrics += 1
+                    # Calculate MoI for this cluster subset Φi
+                    cluster_moi = self.calculate_moment_of_inertia(cluster_points)
+                    
+                    # Validate MoI eigenvalues
+                    eigenvals, eigenvecs = np.linalg.eigh(cluster_moi)
+                    if np.any(eigenvals <= 1e-12):
+                        self.get_logger().warn(f"Cluster {i} invalid MoI eigenvals={eigenvals}, using default")
+                        # Use default initialization based on cluster bounds
+                        cluster_bounds = np.max(cluster_points, axis=0) - np.min(cluster_points, axis=0)
+                        scale = cluster_bounds / 4.0  # Conservative scale
+                        rotation_matrix = np.eye(3)  # Identity rotation
+                    else:
+                        # Initialize ellipsoid with MoI = cluster_MoI / 2 (EXACT as paper)
+                        ellipsoid_params = self.moi_to_ellipsoid_params(cluster_moi / 2.0)
+                        scale = ellipsoid_params['scale']
+                        rotation_matrix = ellipsoid_params['rotation']
+                    
+                    # Validate and clamp scale values
+                    scale = np.clip(scale, 0.005, 0.2)  # Reasonable bounds: 5mm to 20cm
+                    
+                    initial_ellipsoids.append({
+                        'translation': cluster_center,
+                        'scale': scale,
+                        'shape': [1.0, 1.0],  # Ellipsoid (ε1=1, ε2=1)
+                        'rotation': rotation_matrix,
+                        'subset': cluster_points,
+                        'type': f'cluster_{i}'
+                    })
+                    
+                    self.get_logger().info(f"Cluster {i}: center={cluster_center}, scale={scale}, det={np.linalg.det(rotation_matrix):.6f}")
+                    
+                except Exception as cluster_error:
+                    self.get_logger().warn(f"Failed to initialize cluster {i}: {cluster_error}")
+                    continue
+            
+            # STEP 3: Add extra ellipsoid θextra for whole point set X with validation
+            try:
+                global_center = np.mean(points_for_ems, axis=0)
+                
+                # Calculate MoI for the ENTIRE point set X
+                global_moi = self.calculate_moment_of_inertia(points_for_ems)
+                
+                # Initialize ellipsoid with MoI = global_MoI / 2 (EXACT as paper)
+                global_ellipsoid_params = self.moi_to_ellipsoid_params(global_moi / 2.0)
+                global_scale = global_ellipsoid_params['scale']
+                
+                # Validate and clamp scale values (optional safety)
+                global_scale = np.clip(global_scale, 0.01, 0.3)
+                
+                initial_ellipsoids.append({
+                    'translation': global_center,
+                    'scale': global_scale,
+                    'shape': [1.0, 1.0],
+                    'rotation': global_ellipsoid_params['rotation'],  # Use MoI-derived rotation
+                    'subset': points_for_ems,
+                    'type': 'global_extra'
+                })
+                
+                self.get_logger().info(f"Global ellipsoid (MoI/2): center={global_center}, scale={global_scale}")
+                
+            except Exception as global_error:
+                self.get_logger().warn(f"Failed to initialize global ellipsoid: {global_error}")
+            
+            if not initial_ellipsoids:
+                self.get_logger().error("No valid initial ellipsoids created")
+                return None, []
+            
+            self.get_logger().info(f"Initialized {len(initial_ellipsoids)} valid ellipsoids")
+            
+            # STEP 4: Sequential processing with improved error handling
+            fitted_superquadrics = []
+            
+            for i, ellipsoid_init in enumerate(initial_ellipsoids):
+                try:
+                    self.get_logger().info(f"Processing ellipsoid {i+1}/{len(initial_ellipsoids)} ({ellipsoid_init['type']})")
+                    
+                    subset_points = ellipsoid_init['subset']
+                    init_translation = ellipsoid_init['translation']
+                    init_scale = ellipsoid_init['scale']
+                    
+                    # Center the points for EMS (this often helps with bounds issues)
+                    centered_points = subset_points - init_translation
+                    
+                    # Additional validation before EMS
+                    point_span = np.max(centered_points, axis=0) - np.min(centered_points, axis=0)
+                    if np.any(point_span < 1e-6):
+                        self.get_logger().warn(f"Ellipsoid {i+1}: degenerate point span, skipping")
+                        continue
+                    
+                    self.get_logger().info(f"  Centered points span: {point_span}")
+                    self.get_logger().info(f"  Init scale: {init_scale}")
+                    
+                    
+                    # Convert rotation matrix to Euler angles for EMS
+                    init_euler = R_simple.from_matrix(ellipsoid_init['rotation']).as_euler('xyz')
+
+                    sq_candidate, probabilities = EMS_recovery(
+                        centered_points,
+                        # MoI/2 ellipsoid initialization
+                        # InitialShape=ellipsoid_init['shape'],        # [1.0, 1.0] for ellipsoid
+                        # InitialScale=init_scale,                     # MoI/2 derived scale
+                        # InitialEuler=init_euler,                     # MoI/2 derived rotation
+                        # InitialTranslation=np.zeros(3),             # Already centered
+                        # Regular EMS parameters
+                        OutlierRatio=self.outlier_ratio,
+                        MaxIterationEM=60,
+                        ToleranceEM=1e-3,
+                        RelativeToleranceEM=1e-1,
+                        MaxOptiIterations=5,
+                        Sigma=0.02,
+                        MaxiSwitch=1,
+                        AdaptiveUpperBound=True,
+                        Rescale=True
+                    )
+                    
+                    # Translate back to world coordinates
+                    sq_candidate.translation = sq_candidate.translation + init_translation
+                    
+                    # Validate the result
+                    if self._validate_superquadric_strict(sq_candidate, subset_points):
+                        fitted_superquadrics.append(sq_candidate)
                         
-                        # Log quadric parameters
-                        self.get_logger().info(f"Quadric {i+1}: shape=({quadric.shape[0]:.3f}, {quadric.shape[1]:.3f}), "
-                                            f"scale=({quadric.scale[0]:.3f}, {quadric.scale[1]:.3f}, {quadric.scale[2]:.3f})")
-                except Exception as mesh_error:
-                    self.get_logger().warn(f"Failed to create mesh for quadric {i+1}: {mesh_error}")
+                        subset_coverage = np.sum(probabilities > 0.3) / len(centered_points)
+                        full_coverage = self._evaluate_sq_coverage(sq_candidate, subset_points)
+
+                        self.get_logger().info(f"  SUCCESS: Subset coverage={subset_coverage:.3f}, "
+                                            f"Full coverage={full_coverage:.3f}")
+                        self.get_logger().info(f"    Final SQ: Center={sq_candidate.translation}, Scale={sq_candidate.scale}")
+                    else:
+                        self.get_logger().warn(f"  REJECTED: Failed validation")
+                        
+                except Exception as e:
+                    self.get_logger().warn(f"Failed to process ellipsoid {i+1}: {e}")
+                    continue
             
-            # Save visualization files
-            timestamp = int(time.time())
-            os.makedirs("pointclouds", exist_ok=True)
-            # o3d.io.write_point_cloud(f"pointclouds/adaptive_multiquadric_original_{timestamp}.ply", pcd)
+            if not fitted_superquadrics:
+                self.get_logger().error("All ellipsoid initializations failed")
+                return None, []
             
-            # for i, geom in enumerate(geometries[1:]):  # Skip original point cloud
-            #     if hasattr(geom, 'triangles'):  # Check if it's a mesh
-            #         o3d.io.write_triangle_mesh(f"pointclouds/adaptive_sq_{i+1}_{timestamp}.ply", geom)
+            # SELECT BEST SQ based on coverage
+            best_sq = None
+            best_coverage = 0.0
             
-            self.get_logger().info(f"Adaptive multiquadric fitting: {successful_quadrics}/{len(list_quadrics)} successful meshes")
+            for i, sq in enumerate(fitted_superquadrics):
+                coverage = self._evaluate_sq_coverage(sq, points_for_ems)
+                self.get_logger().info(f"SQ {i+1}: coverage = {coverage:.3f}")
+                
+                if coverage > best_coverage:
+                    best_coverage = coverage
+                    best_sq = sq
             
-            # Add coordinate frame
-            coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
-            geometries.append(coord_frame)
+            self.get_logger().info(f"Successfully fitted {len(fitted_superquadrics)} superquadrics")
+            return best_sq, fitted_superquadrics
+
+        except Exception as e:
+            self.get_logger().error(f"Error in ensemble method: {e}")
+            return None, []
+
+    def _validate_superquadric_strict(self, sq, points):
+        """Stricter validation to catch problematic superquadrics"""
+        try:
+            # Check scale bounds more strictly
+            if np.any(sq.scale < 0.003) or np.any(sq.scale > 0.5):
+                return False
             
-            # Visualize all geometries together
-            if self.visualize:
-                o3d.visualization.draw_geometries(
-                    geometries,
-                    window_name=f"Adaptive Multi-Superquadric Fitting (K={len(list_quadrics)})",
-                    zoom=0.7,
-                    front=[0, -1, 0],
-                    lookat=pcd.get_center(),
-                    up=[0, 0, 1]
-                )
+            # Check shape parameters
+            if np.any(np.array(sq.shape) < 0.1) or np.any(np.array(sq.shape) > 4.0):
+                return False
             
-            return successful_quadrics
+            # Check that translation is within reasonable bounds of the data
+            point_center = np.mean(points, axis=0)
+            point_bounds = np.max(points, axis=0) - np.min(points, axis=0)
+            max_deviation = np.linalg.norm(point_bounds) * 0.5
+            
+            if np.linalg.norm(sq.translation - point_center) > max_deviation:
+                return False
+            
+            return True
+            
+        except Exception:
+            return False
+
+
+    def _evaluate_sq_coverage(self, sq, points):
+        """Evaluate how well a superquadric covers the full point cloud"""
+        try:
+            # Transform points to superquadric coordinate system
+            centered_points = points - sq.translation
+            
+            # Rotate points to align with superquadric axes
+            if hasattr(sq, 'RotM'):
+                rotated_points = centered_points @ sq.RotM.T
+            else:
+                rotated_points = centered_points
+            
+            # Calculate superquadric inside/outside function
+            # F(x,y,z) = ((x/a1)^(2/ε2) + (y/a2)^(2/ε2))^(ε2/ε1) + (z/a3)^(2/ε1)
+            
+            # Avoid division by zero
+            safe_scale = np.maximum(sq.scale, 1e-6)
+            
+            # Normalized coordinates
+            normalized = np.abs(rotated_points) / safe_scale
+            
+            # Shape parameters (epsilon values)
+            eps1, eps2 = sq.shape[0], sq.shape[1]
+            eps1 = max(eps1, 0.1)  # Avoid numerical issues
+            eps2 = max(eps2, 0.1)
+            
+            # Superquadric function evaluation
+            xy_term = (normalized[:, 0]**(2/eps2) + normalized[:, 1]**(2/eps2))**(eps2/eps1)
+            z_term = normalized[:, 2]**(2/eps1)
+            F_values = xy_term + z_term
+            
+            # Points are "inside" the superquadric if F <= 1
+            # Use a slightly larger threshold for coverage
+            inside_mask = F_values <= 1.2
+            coverage = np.sum(inside_mask) / len(points)
+            
+            return coverage
             
         except Exception as e:
-            self.get_logger().error(f"Error in adaptive multiquadric visualization: {e}")
-            self.get_logger().error(traceback.format_exc())
-            return 0
+            self.get_logger().warn(f"Error evaluating SQ coverage: {e}")
+            return 0.0
+    
     
     def superquadric_to_open3d_mesh(self, x, threshold=1e-2, num_limit=10000, arclength=0.2):
-        """Convert superquadric to Open3D mesh (same as multiquadric_test.py)"""
+        """Convert superquadric to Open3D mesh"""
         try:
             from EMS.utilities import uniformSampledSuperellipse, create_mesh_from_grid
             
@@ -1351,344 +1251,252 @@ class ZedGpuNode(Node):
             class_id: detected object class ID
             
         Returns:
-            List of 4x4 grasp pose transformation matrices
+            Tuple[List[np.ndarray], Any]: (final_grasp_poses, best_sq) or []
         """
         try:
-            # Use full workspace point cloud and crop around detected object
-            # instead of just using the detected object points (which might be incomplete)
+            # =============================================================================
+            # STEP 1: PREPROCESS POINT CLOUD
+            # =============================================================================
+            self.get_logger().info(f"Processing object with {len(object_points)} points")
             
-            # filter object pointcloud
+            # Create and filter point cloud
             object_pcd = o3d.geometry.PointCloud()
             object_pcd.points = o3d.utility.Vector3dVector(object_points)
             object_pcd = self.preprocess_point_cloud(object_pcd)
-            # object_pcd = object_pcd.remove_statistical_outlier(
-            #     nb_neighbors=100, std_ratio=0.5)[0]
+            object_pcd = object_pcd.remove_statistical_outlier(nb_neighbors=50, std_ratio=0.4)[0]
+            
+            # Validate sufficient points remain
+            if len(object_pcd.points) < 100:
+                self.get_logger().warn(f"Too few points after preprocessing: {len(object_pcd.points)}")
+                return []
+            
             object_points = np.asarray(object_pcd.points)
-            
-            ####################################    
-            import os
-            import time   
-            # Create a directory for saving point clouds
-            pointcloud_dir = "/home/chris/franka_ros2_ws/src/zed_pose_estimation/pointclouds"
-            os.makedirs(pointcloud_dir, exist_ok=True)
-            
-            # Create filename with timestamp and class info
-            timestamp = int(time.time())
-            object_name = self.class_names.get(class_id, f'Class_{class_id}')
-            filename = f"object_{object_name}_class{class_id}_{timestamp}.ply"
-            filepath = os.path.join(pointcloud_dir, filename)
-
-            # Save the detected object points
-            o3d.io.write_point_cloud(filepath, object_pcd)
-            self.get_logger().info(f"Saved object point cloud to: {filepath}")
-            ###################################
-
-            # Get object center from detected points
             object_center = np.mean(object_points, axis=0)
-            self.get_logger().info(f"Object center from detection: {object_center}")
+            self.get_logger().info(f"Object center: {object_center}")
             
-            # Create full workspace point cloud
-            full_workspace_cloud = o3d.geometry.PointCloud()
-            full_workspace_cloud.points = o3d.utility.Vector3dVector(workspace_points)
-            
-            # Estimate object size from detected points to determine crop size
-            if len(object_points) > 10:
-                object_bounds = np.max(object_points, axis=0) - np.min(object_points, axis=0)
-                # Add some margin around the object
-                crop_margin = object_bounds * 1.2
-            else:
-                # Default crop size if we have very few detected points
-                crop_margin = np.array([0.15, 0.15, 0.15])  # 15cm in each direction
-            
-            self.get_logger().info(f"Object bounds from detection: {object_bounds if len(object_points) > 10 else 'using default'}")
-            self.get_logger().info(f"Crop margin: {crop_margin}")
-            
-            # Crop the full workspace around the detected object center
-            # Similar to zed_gpu_node.py approach
-            crop_min = object_center - crop_margin
-            crop_max = object_center + crop_margin
-            
-            # Make sure we don't go below the workspace (table level)
-            crop_min[2] = max(crop_min[2], 0.0)  # Don't go below table
-            
-            self.get_logger().info(f"Cropping workspace from {crop_min} to {crop_max}")
-            
-            # Crop the workspace point cloud to the relevant area
-            cropped_workspace = full_workspace_cloud.crop(
-                o3d.geometry.AxisAlignedBoundingBox(
-                    min_bound=crop_min,
-                    max_bound=crop_max
-                )
-            )
-            
-            self.get_logger().info(f"Cropped workspace: {len(cropped_workspace.points)} points "
-                                f"(from {len(full_workspace_cloud.points)} total)")
-            
-            # Remove points below a certain Z threshold (table surface) if needed
-            if len(cropped_workspace.points) > 0:
-                points_array = np.asarray(cropped_workspace.points)
-                table_threshold = object_center[2] - crop_margin[2] * 0.8  # A bit above the table
-                table_threshold = max(table_threshold, 0.01)  # Ensure we don't go below zero
-                above_table_mask = points_array[:, 2] > table_threshold
-                
-                if np.any(above_table_mask):
-                    filtered_points = points_array[above_table_mask]
-                    cropped_workspace.points = o3d.utility.Vector3dVector(filtered_points)
-                    self.get_logger().info(f"Filtered points above table (z > {table_threshold:.3f}): "
-                                        f"{len(filtered_points)} points")
-            
-            # Save the cropped object points to temporary file for EMS processing
+            # Save temporary file for grasp planner
             temp_file = f"/tmp/object_points_{class_id}_{int(time.time())}.ply"
+            o3d.io.write_point_cloud(temp_file, object_pcd)
             
-            # Save the CROPPED workspace (not just detected points) as PLY file (XYZ only)
-            object_xyz = o3d.geometry.PointCloud()
-            object_xyz.points = cropped_workspace.points  # Use cropped workspace instead of detected points
-            o3d.io.write_point_cloud(temp_file, object_xyz)
-            
-            # Visualize the cropped area vs detected points for comparison
+            # =============================================================================
+            # STEP 2: OPTIONAL INPUT VISUALIZATION
+            # =============================================================================
             if self.visualize:
-                # Color the detected points differently
                 detected_cloud = o3d.geometry.PointCloud()
                 detected_cloud.points = o3d.utility.Vector3dVector(object_points)
-                detected_cloud.paint_uniform_color([1, 0, 0])  # Red for detected points
+                detected_cloud.paint_uniform_color([1, 0, 0])  # Red
                 
-                # Color the cropped workspace
-                cropped_workspace_vis = o3d.geometry.PointCloud(cropped_workspace)
-                cropped_workspace_vis.paint_uniform_color([0, 0, 1])  # Blue for cropped workspace
-                
-                # Add coordinate frame at object center
                 coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
                 coord_frame.translate(object_center)
                 
                 o3d.visualization.draw_geometries(
                     [detected_cloud, coord_frame],
-                    window_name=f"Detected Points (Red) - Class {class_id}",
+                    window_name=f"Detected Points - Class {class_id}",
                     zoom=0.7, front=[0, -1, 0], lookat=object_center, up=[0, 0, 1]
                 )
-                
-            self.get_logger().info(f"Original detected points: {len(object_points)}, "
-                                f"Cropped workspace points: {len(cropped_workspace.points)}")
             
-            # Continue with the rest of your existing superquadric fitting code...
+            # =============================================================================
+            # STEP 3: FIT MULTIPLE SUPERQUADRICS
+            # =============================================================================
+            self.get_logger().info("Fitting multiple superquadrics...")
+            points_for_ems = np.asarray(object_pcd.points)
             
-            # Fit superquadric using EMS on the cropped workspace
-            self.get_logger().info("Fitting superquadric to cropped workspace points...")
+            best_sq, all_valid_sqs = self.fit_multiple_superquadrics_ensemble(points_for_ems)
             
-            
-            # Load points for EMS (it expects numpy array)
-            points_for_ems = np.asarray(object_pcd.points)  # Use detected cloud
-
-            # Fit multiple superquadrics using paper's K calculation
-            # best_sq, all_valid_sqs = self.compare_superquadric_methods(points_for_ems)
-            best_sq, all_valid_sqs = self.fit_multiple_superquadrics_hierarchical(points_for_ems)
-            
-            if self.visualize:
-                self.visualize_hierarchical_multiquadric_fit(
-                    points_for_ems, all_valid_sqs
-                )
-
-            if best_sq is None:
+            if not all_valid_sqs:
                 self.get_logger().error("Multi-superquadric fitting failed")
                 return []
-
-            #   CHANGE: Use ALL superquadrics, not just the best one
-            self.get_logger().info(f"Paper's method complete: Using ALL {len(all_valid_sqs)} superquadrics for grasp generation")
             
-            # Generate grasps from ALL superquadrics
-            all_grasp_poses = []
-            all_sq_info = []
-            all_visualization_grasps = []  # 🔧 NEW: Store ALL grasps for visualization
+            self.get_logger().info(f"Successfully fitted {len(all_valid_sqs)} superquadrics")
+            
+            # Optional superquadric fitting visualization
+            if self.visualize:
+                self.visualize_hierarchical_multiquadric_fit(points_for_ems, all_valid_sqs)
+            
+            # =============================================================================
+            # STEP 4: GENERATE GRASPS FROM ALL SUPERQUADRICS
+            # =============================================================================
+            execution_grasps = {'poses': [], 'info': []}
+            visualization_grasps = {'poses': [], 'info': []}
             
             for i, sq_recovered in enumerate(all_valid_sqs):
                 try:
-                    self.get_logger().info(f"Generating grasps from superquadric {i+1}/{len(all_valid_sqs)}")
-                    self.get_logger().info(f"  SQ {i+1}: Shape=({sq_recovered.shape[0]:.3f}, {sq_recovered.shape[1]:.3f}), "
+                    self.get_logger().info(f"Processing SQ {i+1}/{len(all_valid_sqs)}")
+                    self.get_logger().info(f"  Shape=({sq_recovered.shape[0]:.3f}, {sq_recovered.shape[1]:.3f}), "
                                         f"Scale=({sq_recovered.scale[0]:.3f}, {sq_recovered.scale[1]:.3f}, {sq_recovered.scale[2]:.3f})")
                     
                     consistent_euler = R_simple.from_matrix(sq_recovered.RotM).as_euler('xyz')
-
-                    # Get scored/ranked grasps for execution
+                    
+                    # Generate scored grasps for execution
                     sq_grasp_data = self.grasp_planner.plan_grasps(
-                        temp_file,
-                        sq_recovered.shape,
-                        sq_recovered.scale,
-                        consistent_euler,        
-                        sq_recovered.translation
+                        temp_file, sq_recovered.shape, sq_recovered.scale,
+                        consistent_euler, sq_recovered.translation
                     )
                     
-                    # 🔧 Get ALL valid grasps for visualization
-                    all_grasp_data = self.grasp_planner.get_all_valid_grasps(
-                        temp_file,
-                        sq_recovered.shape,
-                        sq_recovered.scale,
-                        consistent_euler,
-                        sq_recovered.translation
+                    # Generate all grasps for visualization
+                    all_grasp_data = self.grasp_planner.get_all_grasps(
+                        temp_file, sq_recovered.shape, sq_recovered.scale,
+                        consistent_euler, sq_recovered.translation
                     )
                     
-                    # 🔧 Store all grasps with their SQ info for visualization
+                    # Store visualization grasps
                     for grasp_data in all_grasp_data:
-                        all_visualization_grasps.append(grasp_data['pose'])
-                        # Create visualization info (different from execution info)
-                        vis_info = {
+                        visualization_grasps['poses'].append(grasp_data['pose'])
+                        visualization_grasps['info'].append({
                             'sq_index': i,
                             'sq': sq_recovered,
                             'euler': consistent_euler,
                             'grasp_score': grasp_data.get('score', 0.0),
-                            'is_visualization': True  # Mark as visualization data
-                        }
-                        all_sq_info.append(vis_info)
+                            'is_visualization': True
+                        })
                     
-                    self.get_logger().info(f"  SQ {i+1}: Generated {len(all_grasp_data)} total grasps for visualization")
-
-                    # Extract poses and scores from the SCORED return data (for execution)
-                    if sq_grasp_data and len(sq_grasp_data) > 0:
-                        sq_grasp_poses = [data['pose'] for data in sq_grasp_data]
-                        sq_grasp_scores = [data['score'] for data in sq_grasp_data]
+                    self.get_logger().info(f"  Generated {len(all_grasp_data)} visualization grasps")
+                    
+                    # Store execution grasps
+                    if sq_grasp_data:
+                        poses = [data['pose'] for data in sq_grasp_data]
+                        scores = [data['score'] for data in sq_grasp_data]
                         
-                        self.get_logger().info(f"  SQ {i+1}: Generated {len(sq_grasp_poses)} ranked grasps for execution")
-                        for j, (pose, score) in enumerate(zip(sq_grasp_poses, sq_grasp_scores)):
-                            self.get_logger().info(f"    Execution Grasp {j+1}: score = {score:.8f}")
+                        self.get_logger().info(f"  Generated {len(poses)} execution grasps")
                         
-                        # Add execution grasps with superquadric info AND scores
-                        for pose, score in zip(sq_grasp_poses, sq_grasp_scores):
-                            all_grasp_poses.append(pose)
-                            # Create separate execution info
-                            exec_info = {
+                        for pose, score in zip(poses, scores):
+                            execution_grasps['poses'].append(pose)
+                            execution_grasps['info'].append({
                                 'sq_index': i,
                                 'sq': sq_recovered,
                                 'euler': consistent_euler,
                                 'grasp_score': score,
-                                'is_visualization': False  # Mark as execution data
-                            }
-                            # Note: We're using a separate list for execution, but reusing all_sq_info
-                            # You might want to create a separate all_execution_info list
+                                'is_visualization': False
+                            })
+                            
+                            self.get_logger().info(f"    Grasp score: {score:.8f}")
                     else:
-                        self.get_logger().warn(f"  SQ {i+1}: No valid execution grasps generated")
+                        self.get_logger().warn(f"  No execution grasps generated")
                         
                 except Exception as sq_error:
-                    self.get_logger().error(f"Error generating grasps from SQ {i+1}: {sq_error}")
-
-            # 🔧 PROPER VISUALIZATION: Call once with ALL data
-            if self.visualize and all_visualization_grasps:
-                self.get_logger().info(f"Visualizing ALL grasps: {len(all_visualization_grasps)} grasps from {len(all_valid_sqs)} superquadrics")
-                
-                try:
-                    self.visualize_multi_superquadric_grasps(
-                        points_for_ems,
-                        all_valid_sqs,           # All superquadrics
-                        all_visualization_grasps, # ALL grasp poses (not just top-ranked)
-                        all_sq_info             # Info for all grasps
-                    )
-                except Exception as viz_error:
-                    self.get_logger().error(f"Visualization error: {viz_error}")
-            #         self.get_logger().error(traceback.format_exc())
+                    self.get_logger().error(f"Error processing SQ {i+1}: {sq_error}")
             
-            if not all_grasp_poses:
-                self.get_logger().error("No grasps generated from any superquadric")
+            # Validate we have execution grasps
+            if not execution_grasps['poses']:
+                self.get_logger().error("No execution grasps generated from any superquadric")
                 return []
             
-            self.get_logger().info(f"Total grasps from all superquadrics: {len(all_grasp_poses)}")
+            # =============================================================================
+            # STEP 5: SCORE AND RANK ALL GRASPS
+            # =============================================================================
+            self.get_logger().info(f"Ranking {len(execution_grasps['poses'])} grasps...")
             
-            # Replace the entire scoring section (lines 1449-1485) with:
-            self.get_logger().info(f"Ranking {len(all_grasp_poses)} grasps using comprehensive scores...")
-
             scored_grasps = []
-            for i, (grasp_pose, sq_info) in enumerate(zip(all_grasp_poses, all_sq_info)):
-                sq_index = sq_info['sq_index']
-                sq = sq_info['sq']
-                
-                # Use the grasp score from the grasp planner
+            for grasp_pose, sq_info in zip(execution_grasps['poses'], execution_grasps['info']):
+                # Base grasp score from planner
                 grasp_score = sq_info.get('grasp_score', 0.0)
                 
-                # Optional: Add small superquadric quality bonus
-                sq_volume = np.prod(sq.scale)
-                sq_quality_bonus = min(0.1, sq_volume / 0.001)  # Small bonus for reasonable SQ size
-                
-                # Final composite score = main grasp score + small SQ quality bonus
+                # Small superquadric quality bonus
+                sq_volume = np.prod(sq_info['sq'].scale)
+                sq_quality_bonus = min(0.1, sq_volume / 0.001)
                 composite_score = grasp_score + sq_quality_bonus * 0.1
                 
                 scored_grasps.append((composite_score, grasp_pose, sq_info))
-                
-                self.get_logger().info(f"Grasp {i+1}: grasp_score={grasp_score:.8f}, "
-                                    f"sq_bonus={sq_quality_bonus:.6f}, "
-                                    f"final={composite_score:.8f}")
-
+            
             # Sort by score (best first)
             scored_grasps.sort(key=lambda x: x[0], reverse=True)
-
-            self.get_logger().info("Top 5 grasps after comprehensive scoring:")
+            
+            # Log top scores
+            self.get_logger().info("Top 5 grasps:")
             for i, (score, pose, sq_info) in enumerate(scored_grasps[:5]):
                 sq_idx = sq_info['sq_index']
                 grasp_score = sq_info.get('grasp_score', 0.0)
-                grasp_pos = pose[:3, 3]
-                self.get_logger().info(f"  Rank {i+1}: SQ{sq_idx+1}, grasp_score={grasp_score:.8f}, "
-                                    f"final_score={score:.8f}, pos=[{grasp_pos[0]:.3f}, {grasp_pos[1]:.3f}, {grasp_pos[2]:.3f}]")
+                pos = pose[:3, 3]
+                self.get_logger().info(
+                    f"  Rank {i+1}: SQ{sq_idx+1}, grasp_score={grasp_score:.8f}, "
+                    f"final_score={score:.8f}, pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]"
+                )
             
-            # Get top grasps (but keep diversity across superquadrics)
+            # =============================================================================
+            # STEP 6: SELECT DIVERSE GRASPS
+            # =============================================================================
             final_grasp_poses = []
             used_sq_indices = set()
-
-            # First, take the best grasp from each superquadric
+            max_grasps = 15
+            
+            # First pass: best grasp from each superquadric
             for score, grasp_pose, sq_info in scored_grasps:
                 sq_index = sq_info['sq_index']
                 if sq_index not in used_sq_indices:
                     final_grasp_poses.append(grasp_pose)
                     used_sq_indices.add(sq_index)
                     grasp_score = sq_info.get('grasp_score', 0.0)
-                    self.get_logger().info(f"Selected best grasp from SQ {sq_index+1} "
-                                        f"(grasp_score: {grasp_score:.8f}, final_score: {score:.8f})")
-
-            # Then, add more high-scoring grasps from all superquadrics up to a limit
-            max_total_grasps = 15  # Reasonable limit
+                    self.get_logger().info(
+                        f"Selected best from SQ {sq_index+1} "
+                        f"(grasp_score: {grasp_score:.8f}, final_score: {score:.8f})"
+                    )
+            
+            # Second pass: additional high-scoring grasps
             for score, grasp_pose, sq_info in scored_grasps:
-                if len(final_grasp_poses) >= max_total_grasps:
+                if len(final_grasp_poses) >= max_grasps:
                     break
                 
                 # Check for duplicates
-                is_duplicate = False
-                for existing_grasp in final_grasp_poses:
-                    if np.allclose(grasp_pose, existing_grasp, atol=1e-6):
-                        is_duplicate = True
-                        break
+                is_duplicate = any(
+                    np.allclose(grasp_pose, existing, atol=1e-6) 
+                    for existing in final_grasp_poses
+                )
                 
                 if not is_duplicate:
                     final_grasp_poses.append(grasp_pose)
                     grasp_score = sq_info.get('grasp_score', 0.0)
                     sq_index = sq_info['sq_index']
-                    self.get_logger().info(f"Added additional grasp from SQ {sq_index+1} "
-                                        f"(grasp_score: {grasp_score:.8f}, final_score: {score:.8f})")
-
-            self.get_logger().info(f"Final selection: {len(final_grasp_poses)} grasps from {len(used_sq_indices)} superquadrics")
-
-            # Log the BEST grasp that will be published
-            if final_grasp_poses:
-                best_grasp = final_grasp_poses[0]
-                best_score_info = scored_grasps[0]  # First item after sorting is the best
+                    self.get_logger().info(
+                        f"Added additional from SQ {sq_index+1} "
+                        f"(grasp_score: {grasp_score:.8f}, final_score: {score:.8f})"
+                    )
+            
+            # =============================================================================
+            # STEP 7: LOG RESULTS AND VISUALIZE
+            # =============================================================================
+            self.get_logger().info(
+                f"Final selection: {len(final_grasp_poses)} grasps from {len(used_sq_indices)} superquadrics"
+            )
+            
+            # Log best grasp
+            if final_grasp_poses and scored_grasps:
+                best_score_info = scored_grasps[0]
                 best_grasp_score = best_score_info[2].get('grasp_score', 0.0)
                 best_final_score = best_score_info[0]
                 best_sq_index = best_score_info[2]['sq_index']
                 
-                self.get_logger().info(f"BEST GRASP: From SQ {best_sq_index+1}, "
-                                    f"grasp_score={best_grasp_score:.8f}, "
-                                    f"final_score={best_final_score:.8f}")
+                self.get_logger().info(
+                    f"BEST GRASP: From SQ {best_sq_index+1}, "
+                    f"grasp_score={best_grasp_score:.8f}, "
+                    f"final_score={best_final_score:.8f}"
+                )
             
-            #   MULTI-SUPERQUADRIC VISUALIZATION: Show all SQs and their grasps
-            if self.visualize:
-                self.visualize_multi_superquadric_grasps(points_for_ems, all_valid_sqs, all_grasp_poses, all_sq_info)
+            # Final visualization
+            if self.visualize and visualization_grasps['poses']:
+                try:
+                    self.get_logger().info(
+                        f"Visualizing {len(visualization_grasps['poses'])} grasps "
+                        f"from {len(all_valid_sqs)} superquadrics"
+                    )
+                    self.visualize_multi_superquadric_grasps(
+                        points_for_ems,
+                        all_valid_sqs,
+                        visualization_grasps['poses'],
+                        visualization_grasps['info']
+                    )
+                except Exception as viz_error:
+                    self.get_logger().error(f"Visualization error: {viz_error}")
             
-            # Return the best superquadric and all grasps
             return final_grasp_poses, best_sq
             
         except Exception as e:
-            self.get_logger().error(f"Error in multi-superquadric grasp generation: {e}")
+            self.get_logger().error(f"Error in superquadric grasp generation: {e}")
             self.get_logger().error(traceback.format_exc())
             return []
         
     def visualize_multi_superquadric_grasps(self, points_for_ems, all_valid_sqs, all_grasp_poses, all_sq_info):
         """Visualize all superquadrics and their corresponding grasps"""
         try:
-            import open3d as o3d
-            
             # Ensure points_for_ems is a proper numpy array with correct dtype
             if not isinstance(points_for_ems, np.ndarray):
                 points_for_ems = np.array(points_for_ems)
@@ -1781,7 +1589,6 @@ class ZedGpuNode(Node):
                     
                     consistent_euler = R_simple.from_matrix(sq.RotM).as_euler('xyz')
                     
-                    from zed_pose_estimation.vis2 import visualize_superquadric_grasps
                     visualize_superquadric_grasps(
                         point_cloud_data=points_for_ems,
                         superquadric_params={
@@ -1797,47 +1604,6 @@ class ZedGpuNode(Node):
                     
         except Exception as e:
             self.get_logger().error(f"Error in multi-superquadric visualization: {e}")
-
-    def publish_transform(self, position, quaternion, parent_frame, child_frame):
-        """Publish a transform to the tf tree"""
-        try:
-            # Create transform message
-            transform = TransformStamped()
-            
-            # Set header
-            transform.header.stamp = self.get_clock().now().to_msg()
-            transform.header.frame_id = parent_frame
-            
-            # Set child frame
-            transform.child_frame_id = child_frame
-            
-            # Set translation
-            transform.transform.translation.x = float(position[0])
-            transform.transform.translation.y = float(position[1])
-            transform.transform.translation.z = float(position[2]) 
-            
-            # Set rotation
-            transform.transform.rotation.x = float(quaternion[0])
-            transform.transform.rotation.y = float(quaternion[1])
-            transform.transform.rotation.z = float(quaternion[2])
-            transform.transform.rotation.w = float(quaternion[3])
-            
-            # Broadcast the transform
-            # print whole transform for debugging
-            self.get_logger().info(f"Publishing transform {transform.child_frame_id} "
-                                f"from {transform.header.frame_id} at {transform.header.stamp.sec}.{transform.header.stamp.nanosec}")
-            self.get_logger().info(f"Position: {transform.transform.translation.x}, "
-                                f"{transform.transform.translation.y}, {transform.transform.translation.z}")
-            self.get_logger().info(f"Rotation: {transform.transform.rotation.x}, "
-                                f"{transform.transform.rotation.y}, {transform.transform.rotation.z}, "
-                                f"{transform.transform.rotation.w}")
-            # Send the transform
-            self.tf_broadcaster.sendTransform(transform)
-            
-        except Exception as e:
-            self.get_logger().error(f"Error publishing transform: {e}")
-            self.get_logger().error(traceback.format_exc())    
-
             
     def destroy_node(self):
         """Clean up resources when the node is destroyed"""

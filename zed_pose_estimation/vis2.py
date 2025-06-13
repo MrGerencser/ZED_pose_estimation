@@ -4,192 +4,135 @@ import trimesh.transformations as tra
 import os
 from scipy.spatial.transform import Rotation
 
+# Add this to the top of vis2.py
+from zed_pose_estimation.superquadric_grasp_planner import Gripper
 
 def get_gripper_control_points_o3d(
-    grasp,
+    grasp_transform,
+    gripper: Gripper = None,
     show_sweep_volume=False,
     color=(0.2, 0.8, 0),
     finger_tip_to_origin=True):
     """
-    Simple, clear gripper visualization
-    
-    Gripper coordinate system (Visualizer's internal convention for construction):
-    - X-axis: approach direction (gripper moves along this)
-    - Y-axis: side direction  
-    - Z-axis: closing direction (fingers open/close along this)
-    
-    Args:
-        grasp: [4, 4] transformation matrix from planner (defines planner's gripper frame in world)
-        show_sweep_volume: bool, whether to show sweep volume
-        color: RGB color tuple
-        finger_tip_to_origin: bool, if True, finger tips at coordinate frame origin
+    Create gripper visualization using the actual Gripper class
     """
-    meshes = []
+    if gripper is None:
+        gripper = Gripper()  # Use default gripper
     
-    # Extract position and rotation from grasp matrix (which is T_world_plannerFrame)
-    grasp_pos = grasp[:3, 3].copy()
-    grasp_rot_planner_frame = grasp[:3, :3].copy() # This is R_world_plannerFrame
-
-    # Define the rotation from the Visualizer's conventional local frame 
-    # (X=approach, Y=side, Z=closing) to the Planner's local gripper frame
-    # Planner's local frame: X_p=side, Y_p=closing, Z_p=anti-approach (so -Z_p is approach)
-    # R_planner_from_visualizer maps v_visualizer to v_planner
-    # Column 1 (X_visualizer in Planner coords): [0,0,-1] (Viz Approach -> Planner -Z_p)
-    # Column 2 (Y_visualizer in Planner coords): [1,0,0]  (Viz Side     -> Planner  X_p)
-    # Column 3 (Z_visualizer in Planner coords): [0,1,0]  (Viz Closing  -> Planner  Y_p)
-    R_planner_from_visualizer = np.array([
-        [0, -1, 0],
-        [0, 0, 1],
-        [-1, 0, 0]
-    ], dtype=float)
-
-    # Effective rotation matrix for visualization: R_world_visualizerFrame
-    # This matrix's columns will be [approach_world, side_world, closing_world]
-    # as expected by the visualizer's geometry construction logic.
-    grasp_rot = grasp_rot_planner_frame @ R_planner_from_visualizer
+    # FIXED: Handle the new 4-mesh return
+    gripper_meshes = gripper.make_open3d_meshes(colour=color)
     
-    # Gripper dimensions
-    finger_length = 0.041      # Length of each finger
-    finger_width = 0.008      # Thickness of fingers
-    jaw_width = 0.08          # Distance between fingers (fully open)
-    palm_size = 0.02          # Size of gripper palm/base
-    
-    if finger_tip_to_origin:
-        # Finger tips should be at grasp_pos (the coordinate frame origin)
-        finger_tip_pos = grasp_pos
-        # Palm is offset back along approach direction (-X)
-        palm_pos = grasp_pos + grasp_rot @ np.array([-finger_length, 0, 0])
+    # Check how many meshes we got (for backward compatibility)
+    if len(gripper_meshes) == 4:
+        finger_L, finger_R, connector, back_Z = gripper_meshes
+        all_gripper_parts = [finger_L, finger_R, back_Z, connector]
     else:
-        # Palm at grasp_pos, fingers extend forward
-        palm_pos = grasp_pos
-        finger_tip_pos = grasp_pos + grasp_rot @ np.array([finger_length, 0, 0])
+        print(f"Warning: Unexpected number of gripper meshes: {len(gripper_meshes)}")
+        all_gripper_parts = gripper_meshes
     
-    # 1. Create gripper palm/base (green box)
-    palm = o3d.geometry.TriangleMesh.create_box(
-        width=palm_size,    # Along X (approach)
-        height=palm_size,   # Along Y (side)  
-        depth=jaw_width     # Along Z (closing direction)
-    )
-    # Center the palm box
-    palm.translate([-palm_size/2, -palm_size/2, -jaw_width/2])
-    # Orient and position the palm
-    palm_transform = np.eye(4)
-    palm_transform[:3, :3] = grasp_rot
-    palm_transform[:3, 3] = palm_pos
-    palm.transform(palm_transform)
-    palm.paint_uniform_color(color)
-    palm.compute_vertex_normals()
-    meshes.append(palm)
+    # Transform all meshes to world coordinates
+    meshes = []
+    for mesh in all_gripper_parts:
+        # Apply the grasp transformation
+        mesh_world = mesh.transform(grasp_transform)
+        meshes.append(mesh_world)
     
-    # 2. Create right finger (positive Z direction)
-    right_finger = o3d.geometry.TriangleMesh.create_box(
-        width=finger_length,   # Along X (extends forward)
-        height=finger_width,   # Along Y (thin)
-        depth=finger_width     # Along Z (thin)
-    )
-    # Position finger: extends from palm to tip, offset in +Z direction
-    right_finger_center = (palm_pos + finger_tip_pos) / 2 + grasp_rot @ np.array([0, 0, jaw_width/2 - finger_width/2])
-    right_finger.translate([-finger_length/2, -finger_width/2, -finger_width/2])
-    right_finger_transform = np.eye(4)
-    right_finger_transform[:3, :3] = grasp_rot
-    right_finger_transform[:3, 3] = right_finger_center
-    right_finger.transform(right_finger_transform)
-    right_finger.paint_uniform_color(color)
-    right_finger.compute_vertex_normals()
-    meshes.append(right_finger)
+    # Add coordinate frame at grasp pose
+    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.02)
+    coord_frame.transform(grasp_transform)
+    meshes.append(coord_frame)
     
-    # 3. Create left finger (negative Z direction)
-    left_finger = o3d.geometry.TriangleMesh.create_box(
-        width=finger_length,   # Along X (extends forward)
-        height=finger_width,   # Along Y (thin)
-        depth=finger_width     # Along Z (thin)
-    )
-    # Position finger: extends from palm to tip, offset in -Z direction
-    left_finger_center = (palm_pos + finger_tip_pos) / 2 + grasp_rot @ np.array([0, 0, -jaw_width/2 + finger_width/2])
-    left_finger.translate([-finger_length/2, -finger_width/2, -finger_width/2])
-    left_finger_transform = np.eye(4)
-    left_finger_transform[:3, :3] = grasp_rot
-    left_finger_transform[:3, 3] = left_finger_center
-    left_finger.transform(left_finger_transform)
-    left_finger.paint_uniform_color(color)
-    left_finger.compute_vertex_normals()
-    meshes.append(left_finger)
-    
-    # 4. Add finger tip markers (red spheres/boxes)
-    if finger_tip_to_origin:
-        dark_color = np.array(color) * 0.5  # Slightly darker 
-        # Right finger tip
-        right_tip_pos = finger_tip_pos + grasp_rot @ np.array([0, 0, jaw_width/2 - finger_width/2])
-        
-        # Option 1: Small box
-        right_tip = o3d.geometry.TriangleMesh.create_box(width=0.009, height=0.009, depth=0.009)
-        right_tip.translate([-0.0045, -0.0045, -0.0045])  # Center the box
-        right_tip.translate(right_tip_pos)
-        
-        # Option 2: Small sphere (better for finger tips)
-        # right_tip = o3d.geometry.TriangleMesh.create_sphere(radius=0.004)
-        # right_tip.translate(right_tip_pos)
-        
-        right_tip.paint_uniform_color(dark_color)
-        right_tip.compute_vertex_normals()
-        meshes.append(right_tip)
-        
-        # Left finger tip  
-        left_tip_pos = finger_tip_pos + grasp_rot @ np.array([0, 0, -jaw_width/2 + finger_width/2])
-        
-        # Option 1: Small box
-        left_tip = o3d.geometry.TriangleMesh.create_box(width=0.009, height=0.009, depth=0.009)
-        left_tip.translate([-0.0045, -0.0045, -0.0045])  # Center the box
-        left_tip.translate(left_tip_pos)
-        
-        # Option 2: Small sphere (better for finger tips)
-        # left_tip = o3d.geometry.TriangleMesh.create_sphere(radius=0.004)
-        # left_tip.translate(left_tip_pos)
-        
-        left_tip.paint_uniform_color(dark_color)
-        left_tip.compute_vertex_normals()
-        meshes.append(left_tip)
-    
-    # 5. Add approach direction indicator (blue arrow)
-    arrow_length = 0.04
+    # Add approach direction arrow (blue)
+    arrow_length = 0.001
     arrow = o3d.geometry.TriangleMesh.create_arrow(
         cylinder_radius=0.002,
-        cone_radius=0.004, 
+        cone_radius=0.004,
         cylinder_height=arrow_length * 0.7,
         cone_height=arrow_length * 0.3
     )
-    # Arrow points along +X (approach direction)
-    arrow_transform = np.eye(4)
-    arrow_transform[:3, :3] = grasp_rot
-    if finger_tip_to_origin:
-        arrow_start = finger_tip_pos - grasp_rot @ np.array([arrow_length, 0, 0])
+    
+    # Arrow points along gripper's approach direction (-Z in gripper frame)
+    approach_dir = grasp_transform[:3, :3] @ gripper.approach_axis  # -Z axis
+    arrow_pos = grasp_transform[:3, 3] + approach_dir * arrow_length
+    
+    # Orient arrow along approach direction
+    z_axis = np.array([0, 0, 1])
+    if not np.allclose(approach_dir, z_axis):
+        if np.allclose(approach_dir, -z_axis):
+            arrow_rotation = np.array([[-1, 0, 0], [0, -1, 0], [0, 0, -1]])
+        else:
+            v = np.cross(z_axis, approach_dir)
+            s = np.linalg.norm(v)
+            c = np.dot(z_axis, approach_dir)
+            vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+            arrow_rotation = np.eye(3) + vx + (vx @ vx) * ((1 - c) / (s * s))
     else:
-        arrow_start = palm_pos - grasp_rot @ np.array([arrow_length, 0, 0])
-    arrow_transform[:3, 3] = arrow_start
+        arrow_rotation = np.eye(3)
+    
+    arrow_transform = np.eye(4)
+    arrow_transform[:3, :3] = arrow_rotation
+    arrow_transform[:3, 3] = arrow_pos
     arrow.transform(arrow_transform)
     arrow.paint_uniform_color([0.0, 0.0, 1.0])  # Blue
-    arrow.compute_vertex_normals()
     meshes.append(arrow)
     
-    # 6. Add sweep volume if requested
-    if show_sweep_volume:
-        sweep_volume = o3d.geometry.TriangleMesh.create_box(
-            width=finger_length,
-            height=0.02,
-            depth=jaw_width
-        )
-        sweep_volume.translate([-finger_length/2, -0.01, -jaw_width/2])
-        sweep_transform = np.eye(4)
-        sweep_transform[:3, :3] = grasp_rot
-        if finger_tip_to_origin:
-            sweep_transform[:3, 3] = finger_tip_pos + grasp_rot @ np.array([-finger_length/2, 0, 0])
+    # Add closing direction arrow (red)
+    closing_dir = grasp_transform[:3, :3] @ gripper.lambda_local  # Y axis
+    closing_arrow = o3d.geometry.TriangleMesh.create_arrow(
+        cylinder_radius=0.002,
+        cone_radius=0.004,
+        cylinder_height=0.03,
+        cone_height=0.008
+    )
+    
+    # Orient closing arrow
+    if not np.allclose(closing_dir, z_axis):
+        if np.allclose(closing_dir, -z_axis):
+            closing_rotation = np.array([[-1, 0, 0], [0, -1, 0], [0, 0, -1]])
         else:
-            sweep_transform[:3, 3] = palm_pos + grasp_rot @ np.array([finger_length/2, 0, 0])
+            v = np.cross(z_axis, closing_dir)
+            s = np.linalg.norm(v)
+            c = np.dot(z_axis, closing_dir)
+            vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+            closing_rotation = np.eye(3) + vx + (vx @ vx) * ((1 - c) / (s * s))
+    else:
+        closing_rotation = np.eye(3)
+    
+    closing_arrow_transform = np.eye(4)
+    closing_arrow_transform[:3, :3] = closing_rotation
+    closing_arrow_transform[:3, 3] = grasp_transform[:3, 3] + closing_dir * 0.03
+    closing_arrow.transform(closing_arrow_transform)
+    closing_arrow.paint_uniform_color([1.0, 0.0, 0.0])  # Red
+    meshes.append(closing_arrow)
+    
+    # Add sweep volume if requested
+    if show_sweep_volume:
+        # Create sweep volume with correct dimensions
+        # The sweep volume represents the space the gripper occupies during closing
+        sweep_volume = o3d.geometry.TriangleMesh.create_box(
+            width=gripper.thickness * 2,     # X: gripper thickness (finger width)
+            height=gripper.max_open,         # Y: closing direction (finger separation)
+            depth=gripper.jaw_len            # Z: finger length (approach direction)
+        )
+        
+        # Center the sweep volume in gripper local coordinates
+        # The box is created with one corner at origin, so we need to center it
+        sweep_volume.translate([
+            -gripper.thickness,              # Center in X (finger thickness)
+            -gripper.max_open / 2,          # Center in Y (between fingers)
+            -gripper.jaw_len                # Start at finger tips (Z=0), extend backward
+        ])
+        
+        # Apply the grasp transformation to position in world coordinates
+        sweep_transform = grasp_transform.copy()
         sweep_volume.transform(sweep_transform)
+        
+        # Make it semi-transparent blue
         sweep_volume.paint_uniform_color([0.2, 0.2, 0.8])
         meshes.append(sweep_volume)
     
     return meshes
+        
 
 
 def create_cubic_object(size=0.05, center=(0, 0, 0), color=(0.8, 0.2, 0.2)):
@@ -503,10 +446,7 @@ def demo_superquadric_visualization():
     """
     Demo showing how to use the enhanced visualization functions
     """
-    # Example 1: Create some demo data
-    print("Demo 1: Basic cube with single grasp")
-    
-    # Create cube point cloud
+    # Create cube point cloud (shared for all demos)
     cube_points = []
     for x in np.linspace(-0.03, 0.03, 10):
         for y in np.linspace(-0.03, 0.03, 10):
@@ -524,34 +464,98 @@ def demo_superquadric_visualization():
         'translation': np.array([0, 0, 0])      # tx, ty, tz
     }
     
-    # Define grasp pose
-    grasp_pose = {
-        'position': [-0.08, 0, 0],
-        'quaternion': [0, 0, 0, 1]  # [x, y, z, w]
-    }
+    # Example 1: Single grasp using transformation matrix
+    print("Demo 1: Basic cube with single grasp (transformation matrix)")
+    
+    # GRASP FROM LEFT: gripper at (-0.08, 0, 0) pointing toward +X
+    grasp_single = np.array([
+        [0, 0, 1, -0.08],   # X-axis of gripper points in world +Z  
+        [0, 1, 0, 0],       # Y-axis of gripper points in world +Y (closing)
+        [-1, 0, 0, 0],      # Z-axis of gripper points in world -X (approach)
+        [0, 0, 0, 1]
+    ])
     
     visualize_superquadric_grasps(
         point_cloud_data=cube_points,
         superquadric_params=sq_params,
-        grasp_poses=grasp_pose,
-        window_name="Demo 1: Basic Visualization"
+        grasp_poses=grasp_single,  # Single transformation matrix
+        show_sweep_volume=True,
+        window_name="Demo 1: Basic Visualization (Transformation Matrix)"
     )
     
-    # Example 2: Multiple grasps
-    print("\nDemo 2: Multiple grasp poses")
+    # Example 2: Multiple grasps using transformation matrices
+    print("\nDemo 2: Multiple grasp poses (transformation matrices)")
     
-    grasp_poses = [
-        {'position': [-0.08, 0, 0], 'quaternion': [0, 0, 0, 1]},
-        {'position': [0.08, 0, 0], 'quaternion': [0, 0, 1, 0]},  # 180° rotation
-        {'position': [0, -0.08, 0], 'quaternion': [0, 0, 0.707, 0.707]}  # 90° rotation
-    ]
+    # GRASP FROM LEFT: gripper at (-0.08, 0, 0) pointing toward +X
+    grasp_left = np.array([
+        [0, 0, 1, -0.08],   # X-axis of gripper points in world +Z  
+        [0, 1, 0, 0],       # Y-axis of gripper points in world +Y (closing)
+        [-1, 0, 0, 0],      # Z-axis of gripper points in world -X (approach)
+        [0, 0, 0, 1]
+    ])
+    
+    # GRASP FROM RIGHT: gripper at (+0.08, 0, 0) pointing toward -X
+    grasp_right = np.array([
+        [0, 0, -1, 0.08],   # X-axis of gripper points in world -Z
+        [0, 1, 0, 0],       # Y-axis of gripper points in world +Y (closing)  
+        [1, 0, 0, 0],       # Z-axis of gripper points in world +X (approach)
+        [0, 0, 0, 1]
+    ])
+    
+    # GRASP FROM FRONT: gripper at (0, -0.08, 0) pointing toward +Y
+    grasp_front = np.array([
+        [1, 0, 0, 0],       # X-axis of gripper points in world +X
+        [0, 0, 1, -0.08],   # Y-axis of gripper points in world +Z (closing)
+        [0, -1, 0, 0],      # Z-axis of gripper points in world -Y (approach)  
+        [0, 0, 0, 1]
+    ])
+    
+    # GRASP FROM BACK: gripper at (0, +0.08, 0) pointing toward -Y  
+    grasp_back = np.array([
+        [1, 0, 0, 0],       # X-axis of gripper points in world +X
+        [0, 0, -1, 0.08],   # Y-axis of gripper points in world -Z (closing)
+        [0, 1, 0, 0],       # Z-axis of gripper points in world +Y (approach)
+        [0, 0, 0, 1]
+    ])
+    
+    grasp_poses = [grasp_left, grasp_right, grasp_front, grasp_back]
     
     visualize_superquadric_grasps(
         point_cloud_data=cube_points,
         superquadric_params=sq_params,
         grasp_poses=grasp_poses,
-        show_sweep_volume=False,
-        window_name="Demo 2: Multiple Grasps"
+        show_sweep_volume=True,
+        window_name="Demo 2: Multiple Grasps (Transformation Matrices)"
+    )
+    
+    # Example 3: Multiple grasps using quaternions (for comparison)
+    print("\nDemo 3: Multiple grasp poses (quaternions)")
+    
+    # Grasp from left (-X direction)
+    grasp_left_quat = Rotation.from_euler('xyz', [np.pi, 0, np.pi/2])
+    
+    # Grasp from right (+X direction) 
+    grasp_right_quat = Rotation.from_euler('xyz', [np.pi, 0, -np.pi/2])
+    
+    # Grasp from front (-Y direction)
+    grasp_front_quat = Rotation.from_euler('xyz', [np.pi, 0, 0])
+    
+    # Grasp from back (+Y direction)
+    grasp_back_quat = Rotation.from_euler('xyz', [np.pi, 0, np.pi])
+    
+    grasp_poses_quat = [
+        {'position': [-0.08, 0, 0], 'quaternion': grasp_left_quat.as_quat()},   # From left
+        {'position': [0.08, 0, 0], 'quaternion': grasp_right_quat.as_quat()},   # From right  
+        {'position': [0, -0.08, 0], 'quaternion': grasp_front_quat.as_quat()},  # From front
+        {'position': [0, 0.08, 0], 'quaternion': grasp_back_quat.as_quat()}     # From back
+    ]
+    
+    visualize_superquadric_grasps(
+        point_cloud_data=cube_points,
+        superquadric_params=sq_params,
+        grasp_poses=grasp_poses_quat,
+        show_sweep_volume=True,
+        window_name="Demo 3: Multiple Grasps (Quaternions)"
     )
 
 
