@@ -1,3 +1,13 @@
+import sys
+import os
+# Add the parent directory of this 'zed_pose_estimation' package directory to sys.path.
+# This allows 'from zed_pose_estimation.module import ...' to work correctly.
+# The script is in .../src/zed_pose_estimation/zed_pose_estimation/
+# The package is .../src/zed_pose_estimation/zed_pose_estimation/
+# The parent directory that needs to be on sys.path is .../src/zed_pose_estimation/
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+
 #!/usr/bin/env python3
 
 import numpy as np
@@ -21,6 +31,9 @@ from geometry_msgs.msg import PoseStamped, TransformStamped
 from tf2_ros import TransformBroadcaster
 from scipy.spatial.transform import Rotation
 import traceback
+import sys
+
+
 
 class ZedGpuNode(Node):
     def __init__(self):
@@ -365,10 +378,20 @@ class ZedGpuNode(Node):
             pcd_fused_workspace.points = o3d.utility.Vector3dVector(fused_workspace_np)
             pcd_fused_workspace = self.preprocess_point_cloud(pcd_fused_workspace)
             
+            ############################
+            # save the fused workspace point cloud to a file
+            fused_workspace_xyz = o3d.geometry.PointCloud()
+            fused_workspace_xyz.points = pcd_fused_workspace.points
+            
+            
+            o3d.io.write_point_cloud("pointclouds/fused_workspace_xyz.ply", fused_workspace_xyz)
+
             #visualize the workspace point cloud
-            # # Visualize the workspace point cloud
-            # coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
-            # o3d.visualization.draw_geometries([pcd_fused_workspace, coordinate_frame])
+            # Visualize the workspace point cloud
+            coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+            o3d.visualization.draw_geometries([pcd_fused_workspace, coordinate_frame])
+            ############################
+            
             
             pc_time = time.time() - pc_start
             self.timings["Point Cloud Processing"].append(pc_time)
@@ -495,6 +518,22 @@ class ZedGpuNode(Node):
                     if len(object_points) < 50:
                         self.get_logger().warn(f"Object {i} has too few points ({len(object_points)}) for ICP")
                         continue
+                    
+                    # # Generate grasps directly from detected object points
+                    
+                    # grasp_poses = generate_grasps_from_detection(
+                    #     object_points,  # Detected object points
+                    #     fused_workspace_np  # Optional: for collision checking
+                    # )
+                    
+                    # if grasp_poses:
+                    #     # Use first grasp pose
+                    #     best_grasp = grasp_poses[0]
+                    #     grasp_position = best_grasp[:3, 3]
+                    #     grasp_orientation = best_grasp[:3, :3]
+                        
+                    #     self.get_logger().info(f"Generated {len(grasp_poses)} grasps for {self.class_names.get(class_id, 'Unknown')}")
+                    #     self.get_logger().info(f"Best grasp position: {grasp_position}")
                         
                     # Convert object points to Open3D format
                     object_cloud = o3d.geometry.PointCloud()
@@ -508,7 +547,7 @@ class ZedGpuNode(Node):
                         self.get_logger().info(f"Processing {self.class_names.get(class_id, 'Unknown')} for ICP")
                         
                         # Run ICP to get pose
-                        pose_matrix = self.estimate_pose_with_icp(object_cloud, pcd_fused_workspace)
+                        pose_matrix = self.estimate_pose_with_icp2(object_cloud, pcd_fused_workspace)
                         
                         if pose_matrix is not None:
                             # Extract and publish pose
@@ -562,6 +601,7 @@ class ZedGpuNode(Node):
                             # Visualize alignment if requested
                             # if self.visualize_icp:
                             #     self.visualize_alignment(pcd_fused_workspace, pose_matrix)
+                            
                 
                 icp_time = time.time() - icp_start
                 self.timings["ICP"].append(icp_time)
@@ -907,7 +947,50 @@ class ZedGpuNode(Node):
                 zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1],
                 window_name="Cropped Workspace Cloud with PCA"
             )
-
+            
+            ################################################
+            # save observed and cropped clouds to files - XYZ only for EMS compatibility
+            observed_xyz = o3d.geometry.PointCloud()
+            observed_xyz.points = observed_cloud.points  # Copy only points, no colors/normals
+            
+            # filter SOR
+            # observed_xyz, _ = observed_xyz.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+            # observed_xyz = self.preprocess_point_cloud(observed_xyz)
+            # observed_xyz = observed_xyz.voxel_down_sample(voxel_size=self.voxel_size)
+            
+            cropped_xyz = o3d.geometry.PointCloud()
+            cropped_xyz.points = cropped_cloud.points  # Copy only points, no colors/normals
+            
+            # remove z below 0.005
+            cropped_xyz.points = o3d.utility.Vector3dVector(
+                np.asarray(cropped_xyz.points)[np.asarray(cropped_xyz.points)[:, 2] > 0.005]
+            )
+            
+            # filter SOR
+            cropped_xyz, _ = cropped_xyz.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+            cropped_xyz = self.preprocess_point_cloud(cropped_xyz)
+            
+            cropped_xyz2 = o3d.geometry.PointCloud()
+            cropped_xyz2.points = cropped_xyz.points  # Copy only points, no colors/normals
+            
+            o3d.visualization.draw_geometries(
+                [observed_xyz, coord_frame],
+                zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1],
+                window_name="Observed Object Cloud (XYZ only)"
+            )
+            o3d.visualization.draw_geometries(
+                [cropped_xyz2, coord_frame],
+                zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1],
+                window_name="Cropped Workspace Cloud (XYZ only)"
+            )
+            # observed_xyz_real = observed_xyz.points
+            # observed_xyz_real = np.asarray(observed_xyz_real)
+            
+            # Save as ASCII PLY for better compatibility
+            o3d.io.write_point_cloud("pointclouds/observed_cloud.ply", observed_xyz)
+            o3d.io.write_point_cloud("pointclouds/cropped_cloud.ply", cropped_xyz2)
+            ################################################
+            
         # Compute PCA bases
         obs_evals, obs_basis = self.get_pca_basis(np.asarray(observed_cloud.points))
         ref_evals, ref_basis = self.get_pca_basis(reference_points)

@@ -28,7 +28,7 @@ class GraspExecutor(Node):
                 'max_width': 0.08,
                 'goal_width': 0.0,
                 'speed': 0.05,
-                'force': 140.0,
+                'force': 50.0,
                 'epsilon_inner': 0.05,
                 'epsilon_outer': 0.07
             },
@@ -38,7 +38,7 @@ class GraspExecutor(Node):
                 'lift': 0.1
             },
             'timing': {
-                'home': 4, 'gripper': 2, 'pre_grasp': 3,
+                'home': 4, 'gripper': 2, 'pre_grasp': 5,
                 'approach': 2, 'grasp': 2, 'close_gripper': 3,
                 'lift': 3, 'safe': 3
             }
@@ -77,6 +77,10 @@ class GraspExecutor(Node):
         self.status_publisher = self.create_publisher(
             Bool, '/robot/grasp_status', 10
         )
+        
+        self.execution_state_publisher = self.create_publisher(
+        Bool, '/robot/grasp_executing', 10
+     )
     
     def _setup_gripper(self):
         """Setup gripper action clients"""
@@ -178,24 +182,24 @@ class GraspExecutor(Node):
         return new_pose
     
     def _clamp_orientation(self, pose):
-        """Clamp orientation to safe limits"""
+        """Reflect yaw to positive range"""
         quat = [pose.pose.orientation.x, pose.pose.orientation.y,
                 pose.pose.orientation.z, pose.pose.orientation.w]
         
         euler = Rotation.from_quat(quat).as_euler('xyz', degrees=True)
         
-        if euler[1] < -90 or euler[1] > 90:
-            euler[1] = np.clip(euler[1], -90, 90)
+        if euler[2] < -90:
+            euler[2] = np.abs(euler[2])  # Reflect yaw to positive range if yaw is smaller than -90 degrees
             clamped_quat = Rotation.from_euler('xyz', euler, degrees=True).as_quat()
             
             pose.pose.orientation.x = float(clamped_quat[0])
             pose.pose.orientation.y = float(clamped_quat[1])
             pose.pose.orientation.z = float(clamped_quat[2])
             pose.pose.orientation.w = float(clamped_quat[3])
-            
-            self.get_logger().info(f"Clamped pitch to {euler[1]:.1f}°")
-            
-            
+
+            self.get_logger().info(f"Clamped yaw to {euler[2]:.1f}°")
+
+
     def _check_table_collision(self, pose, table_height=0.0):
         """Check if gripper will collide with table
         
@@ -357,6 +361,8 @@ class GraspExecutor(Node):
             self.is_executing = True
             self.should_abort = False
             
+            self._publish_execution_state(True)
+            
             self.get_logger().info("Starting grasp sequence...")
             
             # Define sequence steps
@@ -382,11 +388,25 @@ class GraspExecutor(Node):
             self._publish_status(True)
             self.get_logger().info("Grasp sequence completed successfully!")
             
+            # CLEAR the grasp pose after successful completion
+            self.latest_grasp_pose = None
+            self.get_logger().info("Cleared grasp pose - waiting for new target")
+            
         except Exception as e:
             self.get_logger().error(f"Grasp execution failed: {e}")
             self._publish_status(False)
+            # ALSO clear on failure
+            self.latest_grasp_pose = None
+            self.get_logger().info("Cleared grasp pose after failure - waiting for new target")
         finally:
             self.is_executing = False
+            self._publish_execution_state(False)
+            
+    def _publish_execution_state(self, is_executing):
+        """Publish current execution state"""
+        msg = Bool()
+        msg.data = is_executing
+        self.execution_state_publisher.publish(msg)
     
     def _move_with_offset(self, z_offset, timing_key):
         """Move to grasp pose with Z offset"""

@@ -35,6 +35,7 @@ setup(
             'icp_pose_estimation_node = zed_pose_estimation.icp_pose_estimation_node:main',
             'gpu_segmentation_node = zed_pose_estimation.gpu_segmentation_node:main',
             'zed_gpu_node = zed_pose_estimation.zed_gpu_node:main',
-        ],
+            'superquadric_grasp_node = zed_pose_estimation.superquadric_grasp_node:main',
+            'grasp_executor = zed_pose_estimation.grasp_executor:main',
     },
 )

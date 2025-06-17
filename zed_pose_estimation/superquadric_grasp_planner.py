@@ -9,6 +9,7 @@ import numpy as np
 import open3d as o3d
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial import KDTree
+from zed_pose_estimation.vis2 import get_gripper_control_points_o3d
 
 # ------------------------------------------------------------
 # 1. Superquadric & Gripper definitions  
@@ -43,8 +44,8 @@ class Gripper:
                  jaw_len   = 0.041,   # finger length  (m)
                  max_open  = 0.080,   # maximum jaw separation (m)
                  thickness = 0.004,   # finger thickness l_j (m)
-                 palm_depth= 0.020,   # distance from jaw mid-line to tool flange (m)
-                 palm_width= 0.040):  # width of the aluminium bracket (m)
+                 palm_depth= 0.010,   # distance from jaw mid-line to tool flange (m)
+                 palm_width= 0.020):  # width of the aluminium bracket (m)
 
         # --- geometry used by the paper’s tests --------------------
         self.jaw_len      = float(jaw_len)
@@ -78,7 +79,7 @@ class Gripper:
         
         # Position left finger
         T = np.eye(4)
-        T[1, 3] = +self.max_open / 2    # y-offset
+        T[1, 3] = +self.max_open / 2 + self.thickness   # y-offset
         T[2, 3] = -self.jaw_len / 2     # so tip sits at Z = 0
         finger_L.transform(T)
         meshes.append(finger_L)
@@ -93,7 +94,7 @@ class Gripper:
         
         # Position right finger
         T = np.eye(4)
-        T[1, 3] = -self.max_open / 2
+        T[1, 3] = -self.max_open / 2 - self.thickness  # y-offset
         T[2, 3] = -self.jaw_len / 2
         finger_R.transform(T)
         meshes.append(finger_R)
@@ -101,7 +102,7 @@ class Gripper:
         # 3. CROSS-BAR (axis = Y) - create with correct dimensions directly
         cross_Y = o3d.geometry.TriangleMesh.create_cylinder(
             radius=self.thickness,                      # Keep original thickness
-            height=self.max_open + self.thickness       # Span across fingers
+            height=self.max_open + 4 * self.thickness       # Span across fingers
         )
         cross_Y.paint_uniform_color(colour)
         cross_Y.compute_vertex_normals()
@@ -172,166 +173,79 @@ def rotation_from_u_to_v(u, v):
 DEG = np.pi / 180.0
 
 def principal_axis_sweeps(S: Superquadric, G: Gripper, step_deg=10):
-    # """
-    # §2.1 – CORRECTED: Exactly implement the paper's method
-    # """
-    # candidate_R = []
-    
-    # print(f"[INFO] Implementing paper's method: align λ with each principal axis")
-    # print(f"[DEBUG] Principal axes in world frame:")
-    # print(f"  λ_x: {S.axes_world[:, 0]}")
-    # print(f"  λ_y: {S.axes_world[:, 1]}")  
-    # print(f"  λ_z: {S.axes_world[:, 2]}")
-    # print(f"[DEBUG] Gripper closing line λ: {G.lambda_local}")  # FIXED: Use lambda_local
-    
-    # # PAPER METHOD: For each principal axis λi (i = x,y,z)
-    # for i, axis_world in enumerate(S.axes_world.T):  # iterate over λ_x, λ_y, λ_z
-    #     axis_names = ["λ_x", "λ_y", "λ_z"]  # FIXED: Create proper list
-    #     axis_name = axis_names[i]  # FIXED: Use index to get correct name
-
-    #     print(f"[INFO] Creating set Δ{axis_name}:")
-    #     print(f"  Step 1: Align gripper closing line λ with {axis_name} = {axis_world}")
-        
-    #     # Step 1: Compute Rotation that aligns gripper's closing line λ → principal axis
-    #     R_align = rotation_from_u_to_v(G.lambda_local, axis_world)  # FIXED: Use lambda_local
-        
-    #     print(f"  Step 2: Rotate gripper around {axis_name} every {step_deg}°")
-        
-    #     # Step 2: Rotate the gripper around the aligned axis in step_deg increments  
-    #     rotations_in_set = 0
-    #     for theta_deg in range(0, 360, step_deg):
-    #         theta_rad = theta_deg * DEG
-            
-    #         # Create rotation around the principal axis
-    #         R_spin = R.from_rotvec(axis_world * theta_rad).as_matrix()
-            
-    #         # Combined rotation: first align, then spin
-    #         R_final = R_spin @ R_align
-            
-    #         candidate_R.append(R_final)
-    #         rotations_in_set += 1
-            
-    #         # Debug first few rotations
-    #         if theta_deg < 30:  # Show first 3 rotations for verification
-    #             closing_dir_after = R_final @ G.lambda_local  # FIXED: Use lambda_local
-    #             alignment_check = np.dot(closing_dir_after, axis_world)
-    #             print(f"    θ={theta_deg:3d}°: closing_dir={closing_dir_after}, alignment={alignment_check:.3f}")
-        
-    #     print(f"  → Created set Δ{axis_name} with {rotations_in_set} poses")
-    
-    # expected_total = 3 * (360 // step_deg)  # 3 axes × (360/step_deg) rotations
-    # print(f"[INFO] Paper method complete: {len(candidate_R)} candidates (expected: {expected_total})")
-    
-    # # VERIFICATION: Check that closing line is always aligned with one of the principal axes
-    # print(f"[DEBUG] Verification - checking alignment of first few candidates:")
-    # for i in range(min(9, len(candidate_R))):  # Check first 3 from each axis
-    #     R_candidate = candidate_R[i]
-    #     closing_dir = R_candidate @ G.lambda_local  # FIXED: Use lambda_local
-        
-    #     # Check alignment with each principal axis
-    #     alignments = []
-    #     for j, axis in enumerate(S.axes_world.T):
-    #         alignment = abs(np.dot(closing_dir, axis))
-    #         alignments.append(alignment)
-        
-    #     best_axis_idx = np.argmax(alignments)
-    #     best_alignment = alignments[best_axis_idx]
-    #     axis_name = ["λx", "λy", "λz"][best_axis_idx]
-        
-    #     print(f"  Candidate {i+1}: best aligned with {axis_name} (alignment={best_alignment:.6f})")
-        
-    #     if best_alignment < 0.99:  # Should be nearly 1.0 for perfect alignment
-    #         print(f"WARNING: Poor alignment detected!")
-    
-    # return candidate_R
-    
-    # candidate_R = []
-    
-    # # Find most vertical axis for top-down grasps
-    # vertical_ref = np.array([0.0, 0.0, 1.0])
-    # axis_alignments = []
-    
-    # for i, axis in enumerate(S.axes_world.T):
-    #     alignment = abs(np.dot(axis, vertical_ref))
-    #     axis_alignments.append(alignment)
-    
-    # best_axis_idx = np.argmax(axis_alignments)
-    # best_axis_vector = S.axes_world[:, best_axis_idx]
-    
-    # # Ensure axis points downward for top-down grasps
-    # if best_axis_vector[2] > 1e-6:
-    #     best_axis_vector = -best_axis_vector
-    
-    # #   FIX: Align gripper's closing line (lambda_local = Y-axis) with selected axis
-    # R_align = rotation_from_u_to_v(G.lambda_local, best_axis_vector)
-    
-    # # Rotate around the aligned axis
-    # for theta_deg in range(0, 360, step_deg):
-    #     theta_rad = theta_deg * np.pi / 180.0
-    #     R_spin = R.from_rotvec(best_axis_vector * theta_rad).as_matrix()
-    #     R_final = R_spin @ R_align
-    #     candidate_R.append(R_final)
-    
-    # return candidate_R
-
+    """
+    §2.1 – CORRECTED: Exactly implement the paper's method
+    """
     candidate_R = []
     
-    # Find most vertical axis for top-down grasps
-    vertical_ref = np.array([0.0, 0.0, 1.0])
-    axis_alignments = []
+    print(f"[INFO] Implementing paper's method: align λ with each principal axis")
+    print(f"[DEBUG] Principal axes in world frame:")
+    print(f"  λ_x: {S.axes_world[:, 0]}")
+    print(f"  λ_y: {S.axes_world[:, 1]}")  
+    print(f"  λ_z: {S.axes_world[:, 2]}")
+    print(f"[DEBUG] Gripper closing line λ: {G.lambda_local}")  # FIXED: Use lambda_local
     
-    for i, axis in enumerate(S.axes_world.T):
-        alignment = abs(np.dot(axis, vertical_ref))
-        axis_alignments.append(alignment)
+    # PAPER METHOD: For each principal axis λi (i = x,y,z)
+    for i, axis_world in enumerate(S.axes_world.T):  # iterate over λ_x, λ_y, λ_z
+        axis_names = ["λ_x", "λ_y", "λ_z"]  # FIXED: Create proper list
+        axis_name = axis_names[i]  # FIXED: Use index to get correct name
+
+        print(f"[INFO] Creating set Δ{axis_name}:")
+        print(f"  Step 1: Align gripper closing line λ with {axis_name} = {axis_world}")
+        
+        # Step 1: Compute Rotation that aligns gripper's closing line λ → principal axis
+        R_align = rotation_from_u_to_v(G.lambda_local, axis_world)  # FIXED: Use lambda_local
+        
+        print(f"  Step 2: Rotate gripper around {axis_name} every {step_deg}°")
+        
+        # Step 2: Rotate the gripper around the aligned axis in step_deg increments  
+        rotations_in_set = 0
+        for theta_deg in range(0, 360, step_deg):
+            theta_rad = theta_deg * DEG
+            
+            # Create rotation around the principal axis
+            R_spin = R.from_rotvec(axis_world * theta_rad).as_matrix()
+            
+            # Combined rotation: first align, then spin
+            R_final = R_spin @ R_align
+            
+            candidate_R.append(R_final)
+            rotations_in_set += 1
+            
+            # Debug first few rotations
+            if theta_deg < 30:  # Show first 3 rotations for verification
+                closing_dir_after = R_final @ G.lambda_local  # FIXED: Use lambda_local
+                alignment_check = np.dot(closing_dir_after, axis_world)
+                print(f"    θ={theta_deg:3d}°: closing_dir={closing_dir_after}, alignment={alignment_check:.3f}")
+        
+        print(f"  → Created set Δ{axis_name} with {rotations_in_set} poses")
     
-    best_axis_idx = np.argmax(axis_alignments)
-    print(f"[INFO] Most vertical axis: {['X', 'Y', 'Z'][best_axis_idx]} (alignment: {axis_alignments[best_axis_idx]:.3f})")
+    expected_total = 3 * (360 // step_deg)  # 3 axes × (360/step_deg) rotations
+    print(f"[INFO] Paper method complete: {len(candidate_R)} candidates (expected: {expected_total})")
     
-    # PICK ANOTHER AXIS: Choose the axis with second-best vertical alignment
-    # or alternatively, choose a horizontal axis for side grasping
+    # VERIFICATION: Check that closing line is always aligned with one of the principal axes
+    print(f"[DEBUG] Verification - checking alignment of first few candidates:")
+    for i in range(min(9, len(candidate_R))):  # Check first 3 from each axis
+        R_candidate = candidate_R[i]
+        closing_dir = R_candidate @ G.lambda_local  # FIXED: Use lambda_local
+        
+        # Check alignment with each principal axis
+        alignments = []
+        for j, axis in enumerate(S.axes_world.T):
+            alignment = abs(np.dot(closing_dir, axis))
+            alignments.append(alignment)
+        
+        best_axis_idx = np.argmax(alignments)
+        best_alignment = alignments[best_axis_idx]
+        axis_name = ["λx", "λy", "λz"][best_axis_idx]
+        
+        print(f"  Candidate {i+1}: best aligned with {axis_name} (alignment={best_alignment:.6f})")
+        
+        if best_alignment < 0.99:  # Should be nearly 1.0 for perfect alignment
+            print(f"WARNING: Poor alignment detected!")
     
-    # Option 1: Second most vertical axis
-    sorted_indices = np.argsort(axis_alignments)[::-1]  # Sort in descending order
-    if len(sorted_indices) > 1:
-        selected_axis_idx = sorted_indices[1]  # Second most vertical
-        print(f"[INFO] Selected second most vertical axis: {['X', 'Y', 'Z'][selected_axis_idx]}")
-    else:
-        selected_axis_idx = best_axis_idx  # Fallback if only one axis
-    
-    # Option 2: Most horizontal axis (least vertical alignment)
-    # selected_axis_idx = np.argmin(axis_alignments)
-    # print(f"[INFO] Selected most horizontal axis: {['X', 'Y', 'Z'][selected_axis_idx]} (alignment: {axis_alignments[selected_axis_idx]:.3f})")
-    
-    # Option 3: Specific axis preference (e.g., always use Y-axis if available)
-    # preferred_axis_order = [1, 0, 2]  # Prefer Y, then X, then Z
-    # selected_axis_idx = preferred_axis_order[0]
-    # print(f"[INFO] Selected preferred axis: {['X', 'Y', 'Z'][selected_axis_idx]}")
-    
-    selected_axis_vector = S.axes_world[:, selected_axis_idx]
-    
-    # For side grasps, we might want the axis to point horizontally
-    # Uncomment this if you want horizontal grasping:
-    # if abs(selected_axis_vector[2]) > 0.8:  # If too vertical
-    #     selected_axis_vector = -selected_axis_vector  # Flip it
-    
-    # For top-down grasps on the selected axis:
-    if selected_axis_vector[2] > 1e-6:
-        selected_axis_vector = -selected_axis_vector
-    
-    print(f"[INFO] Using axis vector: {selected_axis_vector} for closing direction")
-    
-    # Align gripper's closing line (lambda_local = Y-axis) with selected axis
-    R_align = rotation_from_u_to_v(G.lambda_local, selected_axis_vector)
-    
-    # Rotate around the aligned axis
-    for theta_deg in range(0, 360, step_deg):
-        theta_rad = theta_deg * np.pi / 180.0
-        R_spin = R.from_rotvec(selected_axis_vector * theta_rad).as_matrix()
-        R_final = R_spin @ R_align
-        candidate_R.append(R_final)
-    
-    print(f"[INFO] Generated {len(candidate_R)} candidates around selected axis")
     return candidate_R
+    
 
 def extra_sweeps_special_shapes(S: Superquadric, base_R_list, G: Gripper):
     """
@@ -418,19 +332,17 @@ def make_world_pose(S: Superquadric, Rg, Δt=np.zeros(3)):
 # 4. Candidate Filtering
 # ------------------------------------------------------------
 
-def support_test(R, t, S, G, kdtree: KDTree, κ=12, r_support=None, h_support=0.02):
+def support_test(R, t, S, G, kdtree: KDTree, κ=12, r_support=None, h_support=0.02, debug_mode=False, max_debug_calls=5):
     """
-    True cylinder support test:
+    True cylinder support test with optional visualization:
     - r_support: cylinder radius (defaults to half jaw width)
     - h_support: half cylinder height
     """
-    return True
     # Closing direction in world
     closing_dir = R @ G.lambda_local
     closing_dir = closing_dir / np.linalg.norm(closing_dir)
 
     # Default support radius: half the jaw opening
-    # default geometry – use paper’s constants
     if r_support is None:
         r_support = 3 * 0.003      # e.g. 3 × voxel_size (≈9 mm)
     if h_support is None:
@@ -442,92 +354,244 @@ def support_test(R, t, S, G, kdtree: KDTree, κ=12, r_support=None, h_support=0.
 
     # Get all points
     X = kdtree.data
-    # Compute point projections onto closing axis
+    
+    # Compute point projections onto closing axis for tip1
     rel1 = X - tip1
     proj1 = np.dot(rel1, closing_dir)
     radial1 = np.linalg.norm(rel1 - np.outer(proj1, closing_dir), axis=1)
     mask1 = (np.abs(proj1) <= h_support) & (radial1 <= r_support)
     cnt1 = np.count_nonzero(mask1)
 
+    # Compute point projections onto closing axis for tip2
     rel2 = X - tip2
     proj2 = np.dot(rel2, closing_dir)
     radial2 = np.linalg.norm(rel2 - np.outer(proj2, closing_dir), axis=1)
     mask2 = (np.abs(proj2) <= h_support) & (radial2 <= r_support)
     cnt2 = np.count_nonzero(mask2)
 
-    return (cnt1 >= κ) and (cnt2 >= κ)
+    support_result = (cnt1 >= κ) and (cnt2 >= κ)
 
+    # --- DEBUG VISUALIZATION ---
+    if debug_mode:
+        if not hasattr(support_test, 'debug_call_count'):
+            support_test.debug_call_count = 0
+        
+        support_test.debug_call_count += 1
+        
+        if support_test.debug_call_count <= max_debug_calls:
+            try:
+                print(f"\n[SUPPORT DEBUG #{support_test.debug_call_count}]")
+                print(f"  Closing direction: {closing_dir}")
+                print(f"  Grasp center: {t}")
+                print(f"  Tip1 center: {tip1}")
+                print(f"  Tip2 center: {tip2}")
+                print(f"  Support cylinder radius: {r_support:.4f}m")
+                print(f"  Support cylinder half-height: {h_support:.4f}m")
+                print(f"  Required points per tip: {κ}")
+                print(f"  Tip1 support points: {cnt1}/{len(X)}")
+                print(f"  Tip2 support points: {cnt2}/{len(X)}")
+                print(f"  Support test result: {'PASS' if support_result else 'FAIL'}")
+                
+                # Visualization
+                _visualize_support_test(
+                    R, t, S, G, kdtree, 
+                    closing_dir, tip1, tip2, r_support, h_support,
+                    mask1, mask2, cnt1, cnt2, κ,
+                    f"Support Test #{support_test.debug_call_count}"
+                )
+                
+            except Exception as viz_error:
+                print(f"    [ERROR] Support visualization failed: {viz_error}")
 
-def collision_test2(R_world,              # 3×3 rotation of the candidate pose
-                   t_world,              # 3×1 grasp centre (mid point of the jaws)
-                   S,                    # Superquadric object (has .ax .ay .az .R .T)
-                   G,                    # Gripper description (has .jaw_len .max_open .lambda_local)
-                   kdtree: KDTree,       # built on the raw point cloud
-                   finger_thickness=None # override if you have a direct measure
-                  ) -> bool:
+    return support_result
+
+def _visualize_support_test(R_world, t_world, S, G, kdtree, 
+                           closing_dir, tip1, tip2, r_support, h_support,
+                           mask1, mask2, cnt1, cnt2, required_points,
+                           window_name="Support Test"):
     """
-    Returns True  → NO collision        (pose is still valid)
-            False → collision detected  (reject this pose)
+    Visualization showing support test logic with color coding
+    """   
+    try:
+        geometries = []
+        X = kdtree.data
+        
+        # 1. Background points (not supporting either tip)
+        background_mask = ~(mask1 | mask2)
+        if np.any(background_mask):
+            pcd_background = o3d.geometry.PointCloud()
+            pcd_background.points = o3d.utility.Vector3dVector(X[background_mask])
+            pcd_background.paint_uniform_color([0.7, 0.7, 0.7])  # Gray background
+            geometries.append(pcd_background)
 
-    Implements: “generate a cylinder whose axis is the closing line λ,
-                 radius = l_j (finger thickness),
-                 half-height = min(a_axis, l_w/2),
-                 centre = t_world (grasp centre);
-                 if any cloud point lies in the slab but outside the cylinder
-                 → collision.”
-    """
-    return True
+        # 2. Support points for tip1
+        if np.any(mask1):
+            tip1_support_points = X[mask1]
+            pcd_tip1 = o3d.geometry.PointCloud()
+            pcd_tip1.points = o3d.utility.Vector3dVector(tip1_support_points)
+            # Color based on whether tip1 has enough support
+            if cnt1 >= required_points:
+                pcd_tip1.paint_uniform_color([0.0, 1.0, 0.0])  # Green = sufficient support
+            else:
+                pcd_tip1.paint_uniform_color([1.0, 0.5, 0.0])  # Orange = insufficient support
+            geometries.append(pcd_tip1)
 
-    # --- 1. closing line in world coordinates -----------------------
-    λ_dir = R_world @ G.lambda_local
-    λ_dir /= np.linalg.norm(λ_dir)       # just in case
+        # 3. Support points for tip2
+        if np.any(mask2):
+            tip2_support_points = X[mask2]
+            pcd_tip2 = o3d.geometry.PointCloud()
+            pcd_tip2.points = o3d.utility.Vector3dVector(tip2_support_points)
+            # Color based on whether tip2 has enough support
+            if cnt2 >= required_points:
+                pcd_tip2.paint_uniform_color([0.0, 0.8, 0.0])  # Slightly different green
+            else:
+                pcd_tip2.paint_uniform_color([1.0, 0.3, 0.0])  # Slightly different orange
+            geometries.append(pcd_tip2)
 
-    # --- 2. pick the SQ semi-axis most aligned with λ --------------
-    λ_local = S.R.T @ λ_dir              # expressed in SQ-local frame
-    axis_idx = np.argmax(np.abs(λ_local))  # 0=x, 1=y, 2=z
-    a_axis   = [S.ax, S.ay, S.az][axis_idx]
+        # 4. Support points for BOTH tips (overlap)
+        overlap_mask = mask1 & mask2
+        if np.any(overlap_mask):
+            overlap_points = X[overlap_mask]
+            pcd_overlap = o3d.geometry.PointCloud()
+            pcd_overlap.points = o3d.utility.Vector3dVector(overlap_points)
+            pcd_overlap.paint_uniform_color([0.0, 0.0, 1.0])  # Blue = supporting both tips
+            geometries.append(pcd_overlap)
 
-    # --- 3. cylinder dimensions ------------------------------------
-    half_open = G.max_open / 2.0
-    half_height = min(a_axis, half_open)           # paper’s rule
+        # 5. Support cylinder visualization for tip1
+        cylinder1 = o3d.geometry.TriangleMesh.create_cylinder(
+            radius=r_support, 
+            height=2 * h_support,
+            resolution=20
+        )
+        
+        # Orient and position cylinder1
+        z_axis = np.array([0, 0, 1])
+        if not np.allclose(closing_dir, z_axis):
+            if np.allclose(closing_dir, -z_axis):
+                cyl_rotation = np.array([[-1, 0, 0], [0, -1, 0], [0, 0, -1]])
+            else:
+                v = np.cross(z_axis, closing_dir)
+                s = np.linalg.norm(v)
+                c = np.dot(z_axis, closing_dir)
+                vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                cyl_rotation = np.eye(3) + vx + (vx @ vx) * ((1 - c) / (s * s))
+        else:
+            cyl_rotation = np.eye(3)
 
-    if finger_thickness is None:
-        finger_thickness = G.jaw_len               # treat jaw_len as thickness
-    radius = finger_thickness                      # paper: r = l_j
+        cylinder1_transform = np.eye(4)
+        cylinder1_transform[:3, :3] = cyl_rotation
+        cylinder1_transform[:3, 3] = tip1
+        cylinder1.transform(cylinder1_transform)
 
-    # --- 4. gather points inside the slab ---------------------------
-    X      = kdtree.data
-    rel    = X - t_world                           # centre on current grasp
-    proj   = rel @ λ_dir                           # signed distance along λ
-    slab_mask = np.abs(proj) <= half_height        # between the two base planes
+        # Create wireframe version for tip1
+        cylinder1_wireframe = o3d.geometry.LineSet.create_from_triangle_mesh(cylinder1)
+        if cnt1 >= required_points:
+            cylinder1_wireframe.paint_uniform_color([0.0, 0.8, 0.0])  # Green wireframe
+        else:
+            cylinder1_wireframe.paint_uniform_color([1.0, 0.0, 0.0])  # Red wireframe
+        geometries.append(cylinder1_wireframe)
 
-    if not np.any(slab_mask):
-        return True                                # empty slab → certainly safe
+        # 6. Support cylinder visualization for tip2
+        cylinder2 = o3d.geometry.TriangleMesh.create_cylinder(
+            radius=r_support, 
+            height=2 * h_support,
+            resolution=20
+        )
+        
+        cylinder2_transform = np.eye(4)
+        cylinder2_transform[:3, :3] = cyl_rotation
+        cylinder2_transform[:3, 3] = tip2
+        cylinder2.transform(cylinder2_transform)
 
-    # radial distance of points inside the slab
-    rel_slab   = rel[slab_mask]
-    proj_slab  = proj[slab_mask]
-    radial_vec = rel_slab - np.outer(proj_slab, λ_dir)
-    radial_len = np.linalg.norm(radial_vec, axis=1)
+        # Create wireframe version for tip2
+        cylinder2_wireframe = o3d.geometry.LineSet.create_from_triangle_mesh(cylinder2)
+        if cnt2 >= required_points:
+            cylinder2_wireframe.paint_uniform_color([0.0, 0.6, 0.0])  # Slightly different green
+        else:
+            cylinder2_wireframe.paint_uniform_color([0.8, 0.0, 0.0])  # Slightly different red
+        geometries.append(cylinder2_wireframe)
 
-    # --- 5. collision decision --------------------------------------
-    colliding = radial_len > radius + 1e-6         # small ε margin
-    return not np.any(colliding)
+        # 7. Grasp center as sphere
+        grasp_center_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.007)
+        grasp_center_sphere.translate(t_world)
+        grasp_center_sphere.paint_uniform_color([1.0, 0.0, 1.0])  # Magenta
+        geometries.append(grasp_center_sphere)
+
+        # 8. Closing direction arrow
+        # Create arrow from grasp center along closing direction
+        arrow_length = h_support * 2.5
+        arrow_end = t_world + closing_dir * arrow_length
+        
+        # Create line for arrow shaft
+        line_points = [t_world, arrow_end]
+        line_lines = [[0, 1]]
+        line_set = o3d.geometry.LineSet()
+        line_set.points = o3d.utility.Vector3dVector(line_points)
+        line_set.lines = o3d.utility.Vector2iVector(line_lines)
+        line_set.paint_uniform_color([1.0, 1.0, 1.0])  # White
+        geometries.append(line_set)
+
+        # 9. Gripper geometry (optional)
+        try:
+            gripper_meshes = G.make_open3d_meshes(colour=(0.2, 0.8, 0.2))
+            gripper_transform = np.eye(4)
+            gripper_transform[:3, :3] = R_world
+            gripper_transform[:3, 3] = t_world
+            
+            for mesh in gripper_meshes:
+                mesh.transform(gripper_transform)
+                geometries.append(mesh)
+                
+        except Exception as gripper_error:
+            print(f"    [ERROR] Could not add gripper visualization: {gripper_error}")
+        
+        # 10. Main coordinate frame
+        main_coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.03)
+        geometries.append(main_coord_frame)
+        
+        # Print legend
+        print(f"\n{'='*60}")
+        print(f"SUPPORT TEST VISUALIZATION:")
+        print(f"{'='*60}")
+        print(f"  🟫 Gray:    Background points (not supporting)")
+        tip1_status = "✅ PASS" if cnt1 >= required_points else "❌ FAIL"
+        tip2_status = "✅ PASS" if cnt2 >= required_points else "❌ FAIL"
+        print(f"  🟢 Green:   Tip1 support points ({cnt1}/{required_points}) {tip1_status}")
+        print(f"  🟢 Lt.Green: Tip2 support points ({cnt2}/{required_points}) {tip2_status}")
+        print(f"  🟣 Magenta: Grasp center")
+        print(f"  ⚪ White:   Closing direction")
+        print(f"  🤖 Robot:   Gripper geometry")
+        print(f"  🟢 Green cylinders: Sufficient support")
+        print(f"  🔴 Red cylinders:   Insufficient support")
+        print(f"{'='*60}")
+        print(f"  Support cylinder radius: {r_support:.3f}m")
+        print(f"  Support cylinder height: {2*h_support:.3f}m")
+        print(f"  Required points per tip: {required_points}")
+        overall_result = "✅ PASS" if (cnt1 >= required_points and cnt2 >= required_points) else "❌ FAIL"
+        print(f"  OVERALL SUPPORT TEST: {overall_result}")
+        
+        # Show visualization
+        o3d.visualization.draw_geometries(
+            geometries,
+            window_name=window_name,
+            zoom=0.6,
+            front=[0, -1, 0],
+            lookat=t_world,
+            up=[0, 0, 1]
+        )
+        
+    except Exception as e:
+        print(f"Error in support test visualization: {e}")
+        import traceback
+        traceback.print_exc()
 
 def collision_test(R_world, t_world, S, G, kdtree: KDTree,
-                   debug_mode=True, max_debug_calls=20) -> bool:
+                   debug_mode=False, max_debug_calls=5) -> bool:
     """
-    CORRECTED IMPLEMENTATION based on paper logic:
+    CORRECTED IMPLEMENTATION with two-slab logic:
     
-    Paper logic: "A pose will be kept in G only if the posed gripper (body)
-    does not intersect with any of the potential collision points in slab"
-    
-    Steps:
-    1. Define slab region around closing line
-    2. Find points inside slab 
-    3. Remove points inside cylinder (these are safe - can be grasped)
-    4. Remaining points = potential collision points
-    5. Check if gripper body intersects with these potential collision points
+    1. Small slab (cylinder region): for safe grasping area
+    2. Large slab (includes fingers): for collision detection
     
     Returns:
         True  → NO collision (pose is valid)
@@ -543,210 +607,303 @@ def collision_test(R_world, t_world, S, G, kdtree: KDTree,
     axis_idx = np.argmax(np.abs(λ_local))
     a_axis = [S.ax, S.ay, S.az][axis_idx]
 
-    # --- 3. cylinder dimensions ------------------------------------
+    # --- 3. TWO DIFFERENT SLAB DEFINITIONS -------------------------
     half_open = G.max_open / 2.0
-    half_height = half_open
+    
+    # SMALL SLAB: Just the cylinder region (for safe grasping)
+    half_height_cylinder = half_open
     radius = G.jaw_len
-
-    # --- 4. gather potential collision points inside the slab ---------------------------
+    
+    # LARGE SLAB: Includes finger extent (for collision detection)
+    half_height_finger = half_open + 2 * G.thickness  # Add finger length to slab
+    
+    # --- 4. GET POINTS FOR BOTH SLABS ------------------------------
     X = kdtree.data
     rel = X - t_world
     proj = rel @ λ_dir
-    slab_mask = np.abs(proj) <= half_height
-
-    if not np.any(slab_mask):
-        collision_result = True  # empty slab → no collision
+    
+    # Small slab mask (cylinder region only)
+    small_slab_mask = np.abs(proj) <= half_height_cylinder
+    
+    # Large slab mask (includes finger extent)
+    large_slab_mask = np.abs(proj) <= half_height_finger
+    
+    if not np.any(large_slab_mask):
+        collision_result = True  # No points in either slab → no collision
         if debug_mode:
-            print(f"    [COLLISION] NO SLAB POINTS - Safe grasp")
+            print(f"    [COLLISION] NO POINTS IN LARGE SLAB - Safe grasp")
         return collision_result
 
-    # --- 5. PAPER LOGIC: Find potential collision points ---------------
-    # Points inside slab
-    slab_points = X[slab_mask]
-    rel_slab = rel[slab_mask]
-    proj_slab = proj[slab_mask]
+    # --- 5. CYLINDER LOGIC: Use SMALL slab for safe grasping ------
+    if np.any(small_slab_mask):
+        # Points inside small slab
+        small_slab_points = X[small_slab_mask]
+        rel_small_slab = rel[small_slab_mask]
+        proj_small_slab = proj[small_slab_mask]
+        
+        # Calculate radial distance from closing line for points in small slab
+        radial_vec_small = rel_small_slab - np.outer(proj_small_slab, λ_dir)
+        radial_len_small = np.linalg.norm(radial_vec_small, axis=1)
+        
+        # Points OUTSIDE cylinder in small slab = potential collision points
+        outside_cylinder_mask_small = radial_len_small > radius
+        potential_collision_points_from_cylinder = small_slab_points[outside_cylinder_mask_small]
+    else:
+        potential_collision_points_from_cylinder = np.array([]).reshape(0, 3)
+        outside_cylinder_mask_small = np.array([], dtype=bool)
+
+    # --- 6. FINGER COLLISION: Use LARGE slab ----------------------
+    # All points in large slab that are NOT in small slab = finger collision candidates
+    large_slab_points = X[large_slab_mask]
     
-    # Calculate radial distance from closing line for points in slab
-    radial_vec = rel_slab - np.outer(proj_slab, λ_dir)
-    radial_len = np.linalg.norm(radial_vec, axis=1)
-    
-    # CRITICAL: Points OUTSIDE cylinder = potential collision points
-    # Points INSIDE cylinder = safe (object can be grasped)
-    outside_cylinder_mask = radial_len > radius
-    potential_collision_points = slab_points[outside_cylinder_mask]
-    
-    if len(potential_collision_points) == 0:
+    # Find points that are in large slab but NOT in small slab
+    # These are the points in the finger extension region
+    finger_region_mask = large_slab_mask.copy()
+    finger_region_mask[small_slab_mask] = False  # Remove small slab points
+    finger_region_points = X[finger_region_mask]
+
+    # Combine all potential collision points
+    if len(potential_collision_points_from_cylinder) > 0 and len(finger_region_points) > 0:
+        all_potential_collision_points = np.vstack([
+            potential_collision_points_from_cylinder,
+            finger_region_points
+        ])
+    elif len(potential_collision_points_from_cylinder) > 0:
+        all_potential_collision_points = potential_collision_points_from_cylinder
+    elif len(finger_region_points) > 0:
+        all_potential_collision_points = finger_region_points
+    else:
         collision_result = True  # No potential collision points → safe
         if debug_mode:
-            print(f"    [COLLISION] All slab points INSIDE cylinder - Safe grasp")
+            print(f"    [COLLISION] No potential collision points - Safe grasp")
         return collision_result
 
-    # --- 6. CHECK IF GRIPPER BODY INTERSECTS WITH POTENTIAL COLLISION POINTS -----
-    # Now we need to check if the gripper fingers would actually collide
-    # with the potential collision points
-    
+    # --- 7. CHECK GRIPPER BODY COLLISIONS -------------------------
     # Check collision with gripper palm/back
     palm_collisions = check_palm_collision(
-        potential_collision_points, t_world, R_world, G
+        all_potential_collision_points, t_world, R_world, G
     )
     
-    # FIX: Initialize has_collision properly
-    has_collision = np.any(palm_collisions) if len(palm_collisions) > 0 else False
+    # Check collision with gripper fingers
+    finger_collisions = check_finger_collision(
+        all_potential_collision_points, t_world, R_world, G
+    )
+    
+    # Combine both collision types
+    has_palm_collision = np.any(palm_collisions) if len(palm_collisions) > 0 else False
+    has_finger_collision = np.any(finger_collisions) if len(finger_collisions) > 0 else False
+    has_collision = has_palm_collision or has_finger_collision
     
     collision_result = not has_collision  # True = no collision
 
-    # ## --- 7. DEBUG OUTPUT ------------------------------------------------
-    # if debug_mode:
-    #     if not hasattr(collision_test, 'debug_call_count'):
-    #         collision_test.debug_call_count = 0
+    # --- 8. DEBUG OUTPUT -------------------------------------------
+    if debug_mode:
+        if not hasattr(collision_test, 'debug_call_count'):
+            collision_test.debug_call_count = 0
         
-    #     collision_test.debug_call_count += 1
+        collision_test.debug_call_count += 1
         
-    #     if collision_test.debug_call_count <= max_debug_calls:
-    #         try:
-    #             slab_points_count = np.sum(slab_mask)
-    #             inside_cylinder_count = slab_points_count - len(potential_collision_points)
-    #             outside_cylinder_count = len(potential_collision_points)
+        if collision_test.debug_call_count <= max_debug_calls:
+            try:
+                small_slab_count = np.sum(small_slab_mask)
+                large_slab_count = np.sum(large_slab_mask)
+                finger_region_count = len(finger_region_points)
+                cylinder_collision_count = len(potential_collision_points_from_cylinder)
                 
-    #             print(f"\n[COLLISION DEBUG #{collision_test.debug_call_count}] - PAPER LOGIC")
-    #             print(f"  Cylinder params: radius={radius:.4f}m, half_height={half_height:.4f}m")
-    #             print(f"  Closing direction λ: {λ_dir}")
-    #             print(f"  Grasp center: {t_world}")
-    #             print(f"  Points in slab: {slab_points_count}/{len(X)}")
-    #             print(f"  Points INSIDE cylinder (safe for grasping): {inside_cylinder_count}")
-    #             print(f"  Points OUTSIDE cylinder (potential collision): {outside_cylinder_count}")
-    #             print(f"  Palm collisions: {np.sum(palm_collisions)}")
-    #             print(f"  Result: {'NO COLLISION' if collision_result else 'COLLISION DETECTED'}")
+                print(f"\n[COLLISION DEBUG #{collision_test.debug_call_count}] - TWO-SLAB LOGIC")
+                print(f"  Small slab (cylinder): half_height={half_height_cylinder:.4f}m, radius={radius:.4f}m")
+                print(f"  Large slab (w/fingers): half_height={half_height_finger:.4f}m")
+                print(f"  Closing direction λ: {λ_dir}")
+                print(f"  Grasp center: {t_world}")
+                print(f"  Points in small slab: {small_slab_count}/{len(X)}")
+                print(f"  Points in large slab: {large_slab_count}/{len(X)}")
+                print(f"  Points in finger region: {finger_region_count}")
+                print(f"  Cylinder collision candidates: {cylinder_collision_count}")
+                print(f"  Total collision candidates: {len(all_potential_collision_points)}")
+                print(f"  Palm collisions: {np.sum(palm_collisions) if len(palm_collisions) > 0 else 0}")
+                print(f"  Finger collisions: {np.sum(finger_collisions) if len(finger_collisions) > 0 else 0}")
+                print(f"  Total collisions: {has_collision}")
+                print(f"  Result: {'NO COLLISION' if collision_result else 'COLLISION DETECTED'}")
                 
-    #             # Visualization with corrected logic
-    #             _visualize_collision_corrected(
-    #                 R_world, t_world, S, G, kdtree, 
-    #                 λ_dir, radius, half_height, slab_mask, outside_cylinder_mask,
-    #                 palm_collisions,
-    #                 f"Paper Logic Collision Test #{collision_test.debug_call_count}"
-    #             )
+                # Visualization with two-slab logic
+                _visualize_collision_two_slab(
+                    R_world, t_world, S, G, kdtree, 
+                    λ_dir, radius, half_height_cylinder, half_height_finger,
+                    small_slab_mask, large_slab_mask, outside_cylinder_mask_small,
+                    palm_collisions, finger_collisions,
+                    f"Two-Slab Collision Test #{collision_test.debug_call_count}"
+                )
                 
-    #         except Exception as viz_error:
-    #             print(f"    [ERROR] Visualization failed: {viz_error}")
+            except Exception as viz_error:
+                print(f"    [ERROR] Visualization failed: {viz_error}")
 
     return collision_result
 
-def check_palm_collision(points, gripper_center, R_world, gripper):
-    """
-    Check if points collide with gripper palm/back region
-    
-    Args:
-        points: Points to check (Nx3)
-        gripper_center: Center position of gripper (3,)
-        R_world: Gripper orientation matrix (3x3)
-        gripper: Gripper object with dimensions
-    
-    Returns:
-        Boolean array indicating which points collide with palm
-    """
+def check_finger_collision(points, gripper_center, R_world, gripper):
+    """Check collision with gripper fingers modeled as cylinders in world frame"""
     if len(points) == 0:
         return np.array([], dtype=bool)
     
-    # Transform points to gripper local coordinates
+    # Work entirely in world coordinates
     rel_points = points - gripper_center
-    local_points = rel_points @ R_world.T  # Transform to gripper frame
     
-    # Check if points are in palm region (behind fingers)
-    # Palm extends from Z=-jaw_len to Z=-jaw_len-palm_depth
-    behind_fingers = (local_points[:, 2] <= -gripper.jaw_len) & (local_points[:, 2] >= -(gripper.jaw_len + gripper.palm_depth))
+    # Get gripper axes in world frame
+    approach_world = R_world @ gripper.approach_axis  # -Z in local becomes approach direction in world
+    closing_world = R_world @ gripper.lambda_local    # +Y in local becomes closing direction in world
+    width_world = R_world @ np.array([1, 0, 0])       # +X in local becomes width direction in world
     
-    # Check if points are within palm width and height
-    within_palm_width = np.abs(local_points[:, 0]) <= gripper.palm_width / 2
-    within_palm_height = np.abs(local_points[:, 1]) <= gripper.max_open / 2
+    # Project points onto gripper axes
+    approach_proj = rel_points @ approach_world
+    closing_proj = rel_points @ closing_world
+    width_proj = rel_points @ width_world
     
-    # Collision occurs if point is in all palm dimensions
-    collisions = behind_fingers & within_palm_width & within_palm_height
+    # Finger cylinder parameters
+    finger_radius = gripper.thickness
+    finger_half_width = gripper.max_open / 2.0
     
+    # CORRECTED: Fingers extend TOWARD the object (in POSITIVE approach direction)
+    # Since approach_axis = [0, 0, -1] and gripper moves toward object in -Z direction,
+    # the approach_world vector points toward the object
+    # Fingers extend from gripper_center in the approach_world direction
+    in_finger_length = (approach_proj >= 0) & (approach_proj <= gripper.jaw_len)
+    
+    # Calculate distance from each finger's center line
+    # Left finger center line: closing_proj = +finger_half_width, any width_proj, approach_proj ∈ [0, +jaw_len]
+    left_finger_closing_dist = np.abs(closing_proj - finger_half_width)
+    left_finger_width_dist = np.abs(width_proj)
+    left_finger_radial_dist = np.sqrt(left_finger_closing_dist**2 + left_finger_width_dist**2)
+    
+    # Right finger center line: closing_proj = -finger_half_width, any width_proj, approach_proj ∈ [0, +jaw_len]  
+    right_finger_closing_dist = np.abs(closing_proj + finger_half_width)
+    right_finger_width_dist = np.abs(width_proj)
+    right_finger_radial_dist = np.sqrt(right_finger_closing_dist**2 + right_finger_width_dist**2)
+    
+    # Check if points are within cylinder radius of either finger
+    near_left_finger = left_finger_radial_dist <= finger_radius
+    near_right_finger = right_finger_radial_dist <= finger_radius
+    
+    # Collision occurs if point is in finger length AND near either finger cylinder
+    finger_collisions = in_finger_length & (near_left_finger | near_right_finger)
+    
+    return finger_collisions
+
+def check_palm_collision(points, gripper_center, R_world, gripper):
+    """Check collision in world frame directly"""
+    if len(points) == 0:
+        return np.array([], dtype=bool)
+    
+    # Work entirely in world coordinates
+    rel_points = points - gripper_center
+    
+    # Get gripper axes in world frame
+    approach_world = R_world @ gripper.approach_axis  # -Z in local becomes approach direction in world
+    closing_world = R_world @ gripper.lambda_local    # +Y in local becomes closing direction in world
+    width_world = R_world @ np.array([1, 0, 0])       # +X in local becomes width direction in world
+    
+    # Project points onto gripper axes
+    approach_proj = rel_points @ approach_world
+    closing_proj = rel_points @ closing_world
+    width_proj = rel_points @ width_world
+    
+    # Palm is in the approach direction (where gripper comes from)
+    # Gripper approaches from positive approach direction, so palm is at positive approach_proj
+    in_approach_region = (approach_proj >= gripper.jaw_len) & (approach_proj <= (gripper.jaw_len + gripper.palm_depth))
+    within_palm_width = np.abs(width_proj) <= gripper.palm_width / 2
+    within_palm_height = np.abs(closing_proj) <= gripper.max_open / 2
+    
+    collisions = in_approach_region & within_palm_width & within_palm_height
     return collisions
 
-def _visualize_collision_corrected(R_world, t_world, S, G, kdtree, 
-                                 lambda_dir, radius, half_height, slab_mask, outside_cylinder_mask, palm_collisions,
-                                 window_name="CORRECTED Collision Test"):
+def _visualize_collision_two_slab(R_world, t_world, S, G, kdtree, 
+                                 lambda_dir, radius, half_height_cylinder, half_height_finger,
+                                 small_slab_mask, large_slab_mask, outside_cylinder_mask_small,
+                                 palm_collisions, finger_collisions,
+                                 window_name="Two-Slab Collision Test"):
     """
-    CORRECTED visualization showing proper collision logic
+    Visualization showing two-slab logic with proper color coding
     """   
     try:
         geometries = []
         X = kdtree.data
         
-        # 1. Original point cloud (gray)
-        pcd_all = o3d.geometry.PointCloud()
-        pcd_all.points = o3d.utility.Vector3dVector(X)
-        pcd_all.paint_uniform_color([0.7, 0.7, 0.7])
-        geometries.append(pcd_all)
-        
-        # 2. Points in slab (yellow background)
-        if np.any(slab_mask):
-            slab_points = X[slab_mask]
-            pcd_slab = o3d.geometry.PointCloud()
-            pcd_slab.points = o3d.utility.Vector3dVector(slab_points)
-            pcd_slab.paint_uniform_color([1.0, 1.0, 0.0])  # Yellow
-            geometries.append(pcd_slab)
+        # 1. Background points (not in any slab)
+        background_mask = ~large_slab_mask
+        if np.any(background_mask):
+            pcd_background = o3d.geometry.PointCloud()
+            pcd_background.points = o3d.utility.Vector3dVector(X[background_mask])
+            pcd_background.paint_uniform_color([0.7, 0.7, 0.7])  # Gray background
+            geometries.append(pcd_background)
+
+        # 2. Small slab points (cylinder region)
+        if np.any(small_slab_mask):
+            small_slab_points = X[small_slab_mask]
             
-            # 3. Points INSIDE cylinder = GREEN (safe for grasping)
-            inside_cylinder_points = slab_points[~outside_cylinder_mask]
+            # Points INSIDE cylinder = GREEN (safe for grasping)
+            inside_cylinder_points = small_slab_points[~outside_cylinder_mask_small]
             if len(inside_cylinder_points) > 0:
                 pcd_safe = o3d.geometry.PointCloud()
                 pcd_safe.points = o3d.utility.Vector3dVector(inside_cylinder_points)
                 pcd_safe.paint_uniform_color([0.0, 1.0, 0.0])  # Green = safe
                 geometries.append(pcd_safe)
             
-            # 4. Points OUTSIDE cylinder = POTENTIAL COLLISION (orange)
-            if np.any(outside_cylinder_mask):
-                potential_collision_points = slab_points[outside_cylinder_mask]
+            # Points OUTSIDE cylinder in small slab = POTENTIAL COLLISION (orange)
+            if np.any(outside_cylinder_mask_small):
+                potential_collision_points = small_slab_points[outside_cylinder_mask_small]
                 pcd_potential = o3d.geometry.PointCloud()
                 pcd_potential.points = o3d.utility.Vector3dVector(potential_collision_points)
                 pcd_potential.paint_uniform_color([1.0, 0.5, 0.0])  # Orange = potential collision
                 geometries.append(pcd_potential)
-                
-                # 5. ACTUAL COLLISION POINTS (red)
-                all_collisions = palm_collisions
-                if np.any(all_collisions):
-                    actual_collision_points = potential_collision_points[all_collisions]
-                    pcd_collision = o3d.geometry.PointCloud()
-                    pcd_collision.points = o3d.utility.Vector3dVector(actual_collision_points)
-                    pcd_collision.paint_uniform_color([1.0, 0.0, 0.0])  # Red = actual collision
-                    geometries.append(pcd_collision)
-                    
-                    print(f"    [VIZ] GREEN: {len(inside_cylinder_points)} safe points INSIDE cylinder")
-                    print(f"    [VIZ] ORANGE: {len(potential_collision_points)} potential collision points")
-                    print(f"    [VIZ] RED: {len(actual_collision_points)} ACTUAL collision points")
+
+        # 3. Finger region points (large slab minus small slab)
+        finger_region_mask = large_slab_mask.copy()
+        finger_region_mask[small_slab_mask] = False
+        if np.any(finger_region_mask):
+            finger_region_points = X[finger_region_mask]
+            pcd_finger_region = o3d.geometry.PointCloud()
+            pcd_finger_region.points = o3d.utility.Vector3dVector(finger_region_points)
+            pcd_finger_region.paint_uniform_color([0.0, 0.0, 1.0])  # Blue = finger region
+            geometries.append(pcd_finger_region)
+
+        # 4. Collision points (from both regions)
+        all_potential_points = []
+        if np.any(small_slab_mask) and np.any(outside_cylinder_mask_small):
+            all_potential_points.extend(X[small_slab_mask][outside_cylinder_mask_small])
+        if np.any(finger_region_mask):
+            all_potential_points.extend(X[finger_region_mask])
         
-        # 6. Gripper geometry
-        try:
-            from zed_pose_estimation.vis2 import get_gripper_control_points_o3d
+        if len(all_potential_points) > 0:
+            all_potential_points = np.array(all_potential_points)
             
-            gripper_transform = np.eye(4)
-            gripper_transform[:3, :3] = R_world
-            gripper_transform[:3, 3] = t_world
+            # Separate collision types for visualization
+            palm_collision_mask = palm_collisions if len(palm_collisions) > 0 else np.zeros(len(all_potential_points), dtype=bool)
+            finger_collision_mask = finger_collisions if len(finger_collisions) > 0 else np.zeros(len(all_potential_points), dtype=bool)
             
-            gripper_meshes = get_gripper_control_points_o3d(
-                gripper_transform,
-                gripper=G,
-                show_sweep_volume=False,  # Show sweep volume for collision context
-                color=(0.2, 0.8, 0.2),
-                finger_tip_to_origin=True
-            )
-            geometries.extend(gripper_meshes)
+            # PALM COLLISION POINTS (red spheres)
+            if np.any(palm_collision_mask):
+                palm_collision_points = all_potential_points[palm_collision_mask]
+                for point in palm_collision_points:
+                    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.003)
+                    sphere.translate(point)
+                    sphere.paint_uniform_color([1.0, 0.0, 0.0])  # Red
+                    geometries.append(sphere)
             
-            print(f"    [GRIPPER DEBUG] Added {len(gripper_meshes)} gripper meshes")
-            
-        except ImportError as import_error:
-            print(f"    [ERROR] Could not import gripper visualization: {import_error}")
-        
-        # 7. Collision cylinder (semi-transparent blue)
+            # FINGER COLLISION POINTS (magenta spheres)
+            if np.any(finger_collision_mask):
+                finger_collision_points = all_potential_points[finger_collision_mask]
+                for point in finger_collision_points:
+                    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.003)
+                    sphere.translate(point)
+                    sphere.paint_uniform_color([1.0, 0.0, 1.0])  # Magenta
+                    geometries.append(sphere)
+
+        # 5. Cylinder visualization (small slab)
         cylinder = o3d.geometry.TriangleMesh.create_cylinder(
             radius=radius, 
-            height=2 * half_height,
+            height=2 * half_height_cylinder,
             resolution=20
         )
         
-        # Orient cylinder along lambda_dir
+        # Orient and position cylinder
         z_axis = np.array([0, 0, 1])
         if not np.allclose(lambda_dir, z_axis):
             if np.allclose(lambda_dir, -z_axis):
@@ -759,40 +916,54 @@ def _visualize_collision_corrected(R_world, t_world, S, G, kdtree,
                 cyl_rotation = np.eye(3) + vx + (vx @ vx) * ((1 - c) / (s * s))
         else:
             cyl_rotation = np.eye(3)
-        
+
         cylinder_transform = np.eye(4)
         cylinder_transform[:3, :3] = cyl_rotation
         cylinder_transform[:3, 3] = t_world
         cylinder.transform(cylinder_transform)
-        cylinder.paint_uniform_color([0.2, 0.2, 0.8])  # Blue
-        geometries.append(cylinder)
+
+        # Create wireframe version
+        cylinder_wireframe = o3d.geometry.LineSet.create_from_triangle_mesh(cylinder)
+        cylinder_wireframe.paint_uniform_color([0.2, 0.2, 0.8])  # Blue wireframe
+        geometries.append(cylinder_wireframe)
+
+        # 6. Large slab boundaries (optional - as planes)
+        # You could add plane visualizations here to show the large slab extent
+
+        # 7. Gripper geometry
+        try:           
+            gripper_transform = np.eye(4)
+            gripper_transform[:3, :3] = R_world
+            gripper_transform[:3, 3] = t_world
+            
+            gripper_meshes = get_gripper_control_points_o3d(
+                gripper_transform,
+                gripper=G,
+                show_sweep_volume=False,
+                color=(0.2, 0.8, 0.2),
+                finger_tip_to_origin=True
+            )
+            geometries.extend(gripper_meshes)
+            
+        except ImportError:
+            print(f"    [ERROR] Could not import gripper visualization")
         
-        # 8. Closing direction arrow
-        closing_arrow = o3d.geometry.TriangleMesh.create_arrow(
-            cylinder_radius=0.003,
-            cone_radius=0.006,
-            cylinder_height=0.04,
-            cone_height=0.01
-        )
-        arrow_transform = np.eye(4)
-        arrow_transform[:3, :3] = cyl_rotation
-        arrow_transform[:3, 3] = t_world + lambda_dir * (half_height + 0.03)
-        closing_arrow.transform(arrow_transform)
-        closing_arrow.paint_uniform_color([0.0, 0.0, 1.0])  # Blue
-        geometries.append(closing_arrow)
-        
-        # 9. Legend/explanation
+        # 8. Legend
         print(f"\n{'='*60}")
-        print(f"PAPER LOGIC COLLISION TEST VISUALIZATION:")
+        print(f"TWO-SLAB COLLISION TEST VISUALIZATION:")
         print(f"{'='*60}")
-        print(f"  🟫 Gray:   All points in point cloud")
-        print(f"  🟨 Yellow: Points inside slab region")
-        print(f"  🟢 Green:  Points INSIDE cylinder (safe for grasping)")
-        print(f"  🟠 Orange: Potential collision points (outside cylinder)")
-        print(f"  🔴 Red:    ACTUAL collision points (gripper intersects)")
-        print(f"  🔵 Blue:   Collision cylinder and closing direction")
-        print(f"  🤖 Robot:  Gripper geometry and sweep volume")
+        print(f"  🟫 Gray:    Background points (outside large slab)")
+        print(f"  🟢 Green:   Safe grasping points (inside cylinder)")
+        print(f"  🟠 Orange:  Potential collision (outside cylinder in small slab)")
+        print(f"  🟨 Yellow:  Finger region points (large slab - small slab)")
+        print(f"  🔴 Red:     PALM collision points")
+        print(f"  🟣 Magenta: FINGER collision points")
+        print(f"  🔵 Blue:    Collision cylinder (small slab)")
+        print(f"  🤖 Robot:   Gripper geometry")
         print(f"{'='*60}")
+        print(f"  Small slab height: {2*half_height_cylinder:.3f}m")
+        print(f"  Large slab height: {2*half_height_finger:.3f}m")
+        print(f"  Cylinder radius: {radius:.3f}m")
         
         # Show visualization
         o3d.visualization.draw_geometries(
@@ -805,7 +976,7 @@ def _visualize_collision_corrected(R_world, t_world, S, G, kdtree,
         )
         
     except Exception as e:
-        print(f"Error in paper logic collision visualization: {e}")
+        print(f"Error in two-slab collision visualization: {e}")
         import traceback
         traceback.print_exc()
 
@@ -828,12 +999,12 @@ def score_grasp(R, t, S, G, kdtree, surface_tol=0.005):
     surface_tol = 0.05 * min(S.ax, S.ay, S.az)
     
     #   DEBUG: Add extensive debugging
-    print(f"    [DEBUG] SQ params: ε1={S.ε1:.3f}, ε2={S.ε2:.3f}")
-    print(f"    [DEBUG] SQ scale: ax={S.ax:.3f}, ay={S.ay:.3f}, az={S.az:.3f}")
-    print(f"    [DEBUG] SQ center: {S.T}")
-    print(f"    [DEBUG] Points range: x=[{pts_local[:, 0].min():.3f}, {pts_local[:, 0].max():.3f}]")
-    print(f"    [DEBUG] Points range: y=[{pts_local[:, 1].min():.3f}, {pts_local[:, 1].max():.3f}]")
-    print(f"    [DEBUG] Points range: z=[{pts_local[:, 2].min():.3f}, {pts_local[:, 2].max():.3f}]")
+    # print(f"    [DEBUG] SQ params: ε1={S.ε1:.3f}, ε2={S.ε2:.3f}")
+    # print(f"    [DEBUG] SQ scale: ax={S.ax:.3f}, ay={S.ay:.3f}, az={S.az:.3f}")
+    # print(f"    [DEBUG] SQ center: {S.T}")
+    # print(f"    [DEBUG] Points range: x=[{pts_local[:, 0].min():.3f}, {pts_local[:, 0].max():.3f}]")
+    # print(f"    [DEBUG] Points range: y=[{pts_local[:, 1].min():.3f}, {pts_local[:, 1].max():.3f}]")
+    # print(f"    [DEBUG] Points range: z=[{pts_local[:, 2].min():.3f}, {pts_local[:, 2].max():.3f}]")
     
     #   CRITICAL FIX: Correct superquadric implicit function
     # Standard form: ((|x/a1|^(2/ε2) + |y/a2|^(2/ε2))^(ε2/ε1) + |z/a3|^(2/ε1))^(1/1) = 1
@@ -870,10 +1041,10 @@ def score_grasp(R, t, S, G, kdtree, surface_tol=0.005):
         
         # Distance from surface (F = 1)
         surface_distances = np.abs(implicit_values - 1.0)
-        
-        print(f"    [DEBUG] Implicit values range: [{implicit_values.min():.6f}, {implicit_values.max():.6f}]")
-        print(f"    [DEBUG] Surface distances range: [{surface_distances.min():.6f}, {surface_distances.max():.6f}]")
-        
+
+        # print(f"    [DEBUG] Implicit values range: [{implicit_values.min():.6f}, {implicit_values.max():.6f}]")
+        # print(f"    [DEBUG] Surface distances range: [{surface_distances.min():.6f}, {surface_distances.max():.6f}]")
+
     except Exception as eq_error:
         print(f"    [ERROR] Equation computation failed: {eq_error}")
         # Fallback: assume no surface points
@@ -884,17 +1055,17 @@ def score_grasp(R, t, S, G, kdtree, surface_tol=0.005):
     base_tolerance = 0.1  # Base tolerance for implicit function
     size_scaled_tolerance = base_tolerance * max(0.5, char_size / 0.05)  # Scale with object size
     
-    print(f"    [DEBUG] Char size: {char_size:.6f}, tolerance: {size_scaled_tolerance:.6f}")
+    # print(f"    [DEBUG] Char size: {char_size:.6f}, tolerance: {size_scaled_tolerance:.6f}")
     
     # Surface mask with adaptive tolerance
     surface_mask = surface_distances < size_scaled_tolerance
     Y = X[surface_mask]
     
-    print(f"    [DEBUG] Surface points found: {len(Y)}/{N} with tolerance {size_scaled_tolerance:.6f}")
+    # print(f"    [DEBUG] Surface points found: {len(Y)}/{N} with tolerance {size_scaled_tolerance:.6f}")
     
     if len(Y) == 0:
         #   FALLBACK: If no surface points, use proximity-based approach
-        print(f"    [FALLBACK] No surface points found, using proximity-based approach")
+        # print(f"    [FALLBACK] No surface points found, using proximity-based approach")
         
         # Find points within reasonable distance of SQ center
         distances_from_center = np.linalg.norm(rel, axis=1)
@@ -905,9 +1076,9 @@ def score_grasp(R, t, S, G, kdtree, surface_tol=0.005):
         
         if len(Y_fallback) > 10:
             Y = Y_fallback[:min(100, len(Y_fallback))]  # Limit to avoid computation issues
-            print(f"    [FALLBACK] Using {len(Y)} proximity points instead")
+            # print(f"    [FALLBACK] Using {len(Y)} proximity points instead")
         else:
-            print(f"    [FALLBACK] Still no good points, using h_α=h_β=0")
+            # print(f"    [FALLBACK] Still no good points, using h_α=h_β=0")
             h_α = 0.0
             h_β = 0.0
             α = float('inf')
@@ -922,7 +1093,7 @@ def score_grasp(R, t, S, G, kdtree, surface_tol=0.005):
                 distances_Y_to_S, _ = tree_surface.query(Y)
                 α = np.mean(distances_Y_to_S)
                 
-                print(f"    [DEBUG] α (mean distance to surface): {α:.6f}")
+                # print(f"    [DEBUG] α (mean distance to surface): {α:.6f}")
                 
                 # Scale q_α with object size
                 q_α = 0.001 * (char_size / 0.05)  # Scale with object size
@@ -946,7 +1117,7 @@ def score_grasp(R, t, S, G, kdtree, surface_tol=0.005):
                 β = T_count / len(S_surface)
                 h_β = β**2
                 
-                print(f"    [DEBUG] β (coverage): {β:.6f}, d_th: {d_th:.6f}")
+                # print(f"    [DEBUG] β (coverage): {β:.6f}, d_th: {d_th:.6f}")
             else:
                 β = 0.0
                 h_β = 0.0
@@ -978,12 +1149,12 @@ def score_grasp(R, t, S, G, kdtree, surface_tol=0.005):
     final_score = h_α * h_β * h_γ * h_δ
 
     # Enhanced debug output
-    print(f"    Detailed scoring breakdown:")
-    print(f"      Surface points: {len(Y)}/{N}")
-    print(f"      α={α:.8f} → h_α={h_α:.8f}")
-    print(f"      β={β:.8f} → h_β={h_β:.8f}")
-    print(f"      γ={γ:.8f} → h_γ={h_γ:.8f}")
-    print(f"      δ={δ:.8f} → h_δ={h_δ:.8f}")
+    # print(f"    Detailed scoring breakdown:")
+    # print(f"      Surface points: {len(Y)}/{N}")
+    # print(f"      α={α:.8f} → h_α={h_α:.8f}")
+    # print(f"      β={β:.8f} → h_β={h_β:.8f}")
+    # print(f"      γ={γ:.8f} → h_γ={h_γ:.8f}")
+    # print(f"      δ={δ:.8f} → h_δ={h_δ:.8f}")
     print(f"      FINAL SCORE: {final_score:.12f}")
 
     return final_score
@@ -1154,81 +1325,6 @@ class SuperquadricGraspPlanner:
         except Exception as e:
             print(f"Error getting all grasps: {e}")
             return []
-            
-    
-    def get_all_valid_grasps(self, point_cloud_path, shape, scale, euler, translation):
-        """
-        Get ALL valid grasps after filtering (for visualization purposes)
-        
-        Returns:
-            List of 4x4 transformation matrices for all valid grasp poses
-        """
-        try:
-            # Create superquadric object
-            S = Superquadric(ε=shape, a=scale, euler=euler, t=translation)
-            G = self.gripper
-            
-            # Load point cloud & build KD-tree
-            pcd = o3d.io.read_point_cloud(point_cloud_path)
-            if not pcd.has_points():
-                return []
-            X = np.asarray(pcd.points)
-            kdtree = KDTree(X)
-            
-            # Generate raw candidates
-            base_R = principal_axis_sweeps(S, G, step_deg=10)
-            all_R, extra_offsets = extra_sweeps_special_shapes(S, base_R, G)
-
-            # Build G_raw
-            G_raw = []
-            for Rg, Δt in extra_offsets:
-                G_raw.append(make_world_pose(S, Rg, Δt))
-            seen_rots = set()
-            for Rg, _ in extra_offsets:
-                key = tuple(np.round(Rg, 6).ravel())
-                seen_rots.add(key)
-            for Rg in all_R:
-                key = tuple(np.round(Rg, 6).ravel())
-                if key not in seen_rots:
-                    G_raw.append(make_world_pose(S, Rg, np.zeros(3)))
-                    seen_rots.add(key)
-
-            # Filter for valid grasps
-            G_valid = []
-            for Rg, tg in G_raw:
-                if support_test(Rg, tg, S, G, kdtree) and collision_test(Rg, tg, S, G, kdtree):
-                    G_valid.append((Rg, tg))
-            
-            print(f"[INFO] Found {len(G_valid)} valid grasps for visualization")
-            
-            # Score all valid grasps
-            grasp_data = []
-            for Rg, tg in G_valid:
-                score = score_grasp(Rg, tg, S, G, kdtree)
-                T = np.eye(4)
-                T[:3, :3] = Rg
-                T[:3, 3] = tg
-                
-                grasp_data.append({
-                    'pose': T,
-                    'score': score,
-                    'rotation': Rg,
-                    'translation': tg
-                })
-            
-            # Sort by score for better visualization
-            grasp_data.sort(key=lambda x: x['score'], reverse=True)
-            
-            print(f"[INFO] Found {len(grasp_data)} valid grasps with scores for visualization")
-            
-            # Store for future reference
-            self.last_valid_grasps = [data['pose'] for data in grasp_data]
-            
-            return grasp_data  # Return with scores
-            
-        except Exception as e:
-            print(f"Error getting all valid grasps: {e}")
-            return []
 
     def plan_grasps(self, point_cloud_path, shape, scale, euler, translation, max_grasps=5):
         """
@@ -1287,14 +1383,14 @@ class SuperquadricGraspPlanner:
 
             # First: Support test only
             for Rg, tg in G_raw:
-                if support_test(Rg, tg, S, G, kdtree):
+                if support_test(Rg, tg, S, G, kdtree, debug_mode=True, max_debug_calls=3):  # Show first 3
                     G_after_support.append((Rg, tg))
 
             print(f"[INFO] {len(G_after_support)}/{len(G_raw)} grasps remain after support filtering.")
 
             # Second: Collision test on support-passing grasps
             for Rg, tg in G_after_support:
-                if collision_test(Rg, tg, S, G, kdtree):
+                if collision_test(Rg, tg, S, G, kdtree, debug_mode=False):
                     G_valid.append((Rg, tg))
 
             print(f"[INFO] {len(G_valid)}/{len(G_after_support)} grasps remain after collision filtering.")
@@ -1315,109 +1411,10 @@ class SuperquadricGraspPlanner:
             scored_grasps = list(zip(scores, G_valid))
             scored_grasps.sort(key=lambda x: x[0], reverse=True)
             
-            print(f"[INFO] Top scores: {[score for score, _ in scored_grasps[:5]]}")
-            
-            def unique_by_tips(scored_grasp_list, G_gripper, tol=2e-3):
-                """
-                Remove grasps that have the same finger tip positions (differ only by wrist roll)
-                """
-                seen_tips = []
-                unique_grasps = []
-                
-                for score, (Rg, tg) in scored_grasp_list:
-                    # Calculate finger tip positions for this grasp
-                    closing_dir = Rg @ G_gripper.lambda_local
-                    half_open = G_gripper.max_open / 2.0
-                    tip1 = tg + closing_dir * half_open
-                    tip2 = tg - closing_dir * half_open
-                    
-                    # Check if these tips are already seen
-                    is_duplicate = False
-                    for existing_tip1, existing_tip2 in seen_tips:
-                        if (np.linalg.norm(tip1 - existing_tip1) < tol and 
-                            np.linalg.norm(tip2 - existing_tip2) < tol):
-                            is_duplicate = True
-                            break
-                        # Also check flipped order (tip1 <-> tip2)
-                        if (np.linalg.norm(tip1 - existing_tip2) < tol and 
-                            np.linalg.norm(tip2 - existing_tip1) < tol):
-                            is_duplicate = True
-                            break
-                    
-                    if not is_duplicate:
-                        seen_tips.append((tip1, tip2))
-                        unique_grasps.append((score, (Rg, tg)))
-                
-                return unique_grasps
-            
-            # Apply unique filtering as per paper's method
-            unique_scored_grasps = unique_by_tips(scored_grasps, G, tol=2e-3)
-            
-            print(f"[INFO] After duplicate removal: {len(unique_scored_grasps)}/{len(scored_grasps)} grasps remain")
-            print(f"[INFO] Top scores after duplicate removal: {[score for score, _ in unique_scored_grasps[:5]]}")
-            
-            # Now proceed with diversity selection from unique grasps
-            diverse_grasps = []
-            diverse_scores = []
-            min_rotation_diff = 0.3  # Minimum rotation difference (radians)
-            min_position_diff = 0.02  # Minimum position difference (2cm)
-            
-            for score, (Rg, tg) in unique_scored_grasps:  # Use unique_scored_grasps instead
-                is_diverse = True
-                
-                # Check if this grasp is sufficiently different from already selected ones
-                for existing_R, existing_t in diverse_grasps:
-                    # Check position difference
-                    pos_diff = np.linalg.norm(tg - existing_t)
-                    # Check rotation difference
-                    rot_similarity = np.trace(Rg.T @ existing_R)
-                    angle_diff = np.arccos(np.clip((rot_similarity - 1) / 2, -1, 1))
-                    
-                    if pos_diff < min_position_diff and angle_diff < min_rotation_diff:
-                        is_diverse = False
-                        break
-                
-                if is_diverse:
-                    diverse_grasps.append((Rg, tg))
-                    diverse_scores.append(score)
-                    print(f"Selected diverse grasp {len(diverse_grasps)}: score={score:.8f}, pos={tg}")
-                    
-                    if len(diverse_grasps) >= max_grasps:
-                        break
-            
-            
-            # Select grasps with different orientations
-            diverse_grasps = []
-            diverse_scores = []  # Keep track of scores for diverse grasps
-            min_rotation_diff = 0.3  # Minimum rotation difference (radians)
-            min_position_diff = 0.02  # Minimum position difference (2cm)
-            
-            for score, (Rg, tg) in scored_grasps:
-                is_diverse = True
-                
-                # Check if this grasp is sufficiently different from already selected ones
-                for existing_R, existing_t in diverse_grasps:
-                    # Check position difference
-                    pos_diff = np.linalg.norm(tg - existing_t)
-                    # Check rotation difference
-                    rot_similarity = np.trace(Rg.T @ existing_R)
-                    angle_diff = np.arccos(np.clip((rot_similarity - 1) / 2, -1, 1))
-                    
-                    if pos_diff < min_position_diff and angle_diff < min_rotation_diff:
-                        is_diverse = False
-                        break
-                
-                if is_diverse:
-                    diverse_grasps.append((Rg, tg))
-                    diverse_scores.append(score)  # Store the corresponding score
-                    print(f"Selected diverse grasp {len(diverse_grasps)}: score={score:.8f}, pos={tg}")
-                    
-                    if len(diverse_grasps) >= max_grasps:
-                        break
             
             # Return both poses and their scores
             grasp_data = []
-            for i, ((Rg, tg), score) in enumerate(zip(diverse_grasps, diverse_scores)):
+            for i, (score, (Rg, tg)) in enumerate(scored_grasps):
                 T = np.eye(4)
                 T[:3, :3] = Rg
                 T[:3, 3] = tg
@@ -1448,3 +1445,401 @@ class SuperquadricGraspPlanner:
             traceback.print_exc()
             return []
 
+    def select_best_grasp_with_criteria(self, grasp_data_list, object_center=None):
+        """
+        Select the best grasp using multi-criteria optimization
+        
+        Args:
+            grasp_data_list: List of dicts with 'pose', 'score', 'rotation', 'translation'
+            object_center: Center of the object (optional, computed if None)
+            
+        Returns:
+            Dict: Best grasp data with additional 'selection_info' key
+        """
+        if not grasp_data_list:
+            return None
+        
+        if len(grasp_data_list) == 1:
+            return grasp_data_list[0]
+        
+        # Compute object center if not provided
+        if object_center is None:
+            positions = [data['translation'] for data in grasp_data_list]
+            object_center = np.mean(positions, axis=0)
+        
+        # Robot base origin (your robot starts at x=0.5, y=0.0, z=0.4)
+        robot_origin = np.array([0.5, 0.0, 0.4])
+        
+        # Preferred approach direction (gripper approaches from +Z direction, not -Z)
+        preferred_approach = np.array([0.0, 0.0, 1.0])  # Upward approach (from above)
+
+        # Table height constraint
+        table_height = 0.0  # Assuming table at z=0
+        
+        best_energy = float('inf')
+        best_grasp = None
+        
+        print(f"[SELECTION] Robot base at: {robot_origin}")
+        print(f"[SELECTION] Preferred approach direction: {preferred_approach}")
+        print(f"[SELECTION] Object center: {object_center}")
+        print(f"[SELECTION] Table height: {table_height}")
+        
+        # NEW: Pre-filter grasps to remove physically impossible ones
+        valid_grasps = []
+        for i, grasp_data in enumerate(grasp_data_list):
+            pose = grasp_data['pose']
+            position = pose[:3, 3]
+            rotation_matrix = pose[:3, :3]
+            
+            # Check 1: Gripper position must be above table
+            if position[2] <= table_height + 0.01:  # 1cm safety margin above table
+                print(f"  [FILTER] Rejected grasp {i+1}: position too low (z={position[2]:.3f}m)")
+                continue
+            
+            # Check 2: Approach direction must not be from below table
+            gripper_z_world = rotation_matrix[:, 2]
+            actual_approach_direction = -gripper_z_world  # Gripper approaches in -Z direction
+            
+            # If approach direction has negative Z component, gripper is approaching from below
+            if actual_approach_direction[2] < -0.5:  # Strong downward approach = approaching from below
+                print(f"  [FILTER] Rejected grasp {i+1}: approaching from below table (approach_z={actual_approach_direction[2]:.3f})")
+                continue
+            
+            # Check 3: Ensure gripper fingers won't go through table
+            # Calculate finger tip positions
+            closing_dir = rotation_matrix @ self.gripper.lambda_local
+            half_open = self.gripper.max_open / 2.0
+            tip1 = position + closing_dir * half_open
+            tip2 = position - closing_dir * half_open
+            
+            # Both finger tips must be above table
+            if tip1[2] <= table_height + 0.005 or tip2[2] <= table_height + 0.005:  # 5mm safety margin
+                print(f"  [FILTER] Rejected grasp {i+1}: finger tips below table (tip1_z={tip1[2]:.3f}m, tip2_z={tip2[2]:.3f}m)")
+                continue
+            
+            # Check 4: Gripper body collision with table
+            # The gripper extends in the approach direction, check if any part goes below table
+            gripper_extent_in_approach = self.gripper.jaw_len + self.gripper.palm_depth
+            furthest_point = position + actual_approach_direction * gripper_extent_in_approach
+            
+            if furthest_point[2] <= table_height + 0.01:  # 1cm safety margin
+                print(f"  [FILTER] Rejected grasp {i+1}: gripper body below table (extent_z={furthest_point[2]:.3f}m)")
+                continue
+            
+            # If all checks pass, add to valid grasps
+            valid_grasps.append((i, grasp_data))
+        
+        print(f"[SELECTION] After table collision filtering: {len(valid_grasps)}/{len(grasp_data_list)} grasps remain")
+        
+        if not valid_grasps:
+            print("[WARNING] No grasps remain after table collision filtering!")
+            return None
+        
+        for original_idx, grasp_data in valid_grasps:
+            try:
+                pose = grasp_data['pose']
+                base_score = grasp_data['score']
+                position = pose[:3, 3]
+                rotation_matrix = pose[:3, :3]
+                
+                # FIXED: Correct approach vector interpretation
+                gripper_z_world = rotation_matrix[:, 2]  # Z-axis of gripper in world
+                actual_approach_direction = -gripper_z_world  # Gripper approaches in -Z direction
+                
+                # === CRITERIA EVALUATION ===
+                
+                # 1. Distance to robot base (CORRECTED)
+                distance_to_base = np.linalg.norm(position - robot_origin)
+                distance_score = 1.0 / (1.0 + distance_to_base)
+                
+                # 2. Reachability penalty (ADJUSTED for robot's reach from new base position)
+                max_reach = 0.855  # Panda's maximum reach from base
+                reach_penalty = max(0.0, (distance_to_base - max_reach) * 3.0)
+                
+                # 3. Height preference (ENHANCED - stronger penalty for low grasps)
+                height_score = 1.0
+                if position[2] < table_height + 0.02:  # Too close to table
+                    height_score = 0.05  # REDUCED: Strong penalty for very low grasps
+                elif position[2] < table_height + 0.05:  # Slightly low
+                    height_score = 0.3   # REDUCED: Medium penalty for low grasps
+                elif position[2] > robot_origin[2] + 0.2:  # Too high above robot
+                    height_score = 0.7
+                
+                # 4. ENHANCED: Approach direction alignment with stronger penalty for downward approaches
+                approach_alignment = np.dot(actual_approach_direction, preferred_approach)
+                approach_score = max(0.0, approach_alignment)
+                
+                # NEW: Additional penalty for approaches that are too horizontal or downward
+                if actual_approach_direction[2] < 0.3:  # Not sufficiently upward
+                    approach_penalty = 2.0 * (0.3 - actual_approach_direction[2])  # Penalty increases as approach becomes more horizontal/downward
+                else:
+                    approach_penalty = 0.0
+                
+                # 5. Orientation stability (unchanged)
+                euler_angles = R.from_matrix(rotation_matrix).as_euler('xyz')
+                roll, pitch, yaw = euler_angles
+                orientation_penalty = (
+                    (abs(roll) / np.pi) * 0.5 +
+                    (abs(pitch) / np.pi) * 0.3 +
+                    (abs(yaw) / np.pi) * 0.2
+                )
+                
+                # 6. Object proximity (unchanged)
+                distance_to_object = np.linalg.norm(position - object_center)
+                object_proximity_score = 1.0 / (1.0 + distance_to_object * 10.0)
+                
+                # 7. Enhanced collision avoidance (stricter table height check)
+                collision_score = 0.01 if position[2] < table_height + 0.02 else 1.0  # ENHANCED: Stricter penalty
+                
+                # 8. Workspace preference (unchanged)
+                workspace_distance = np.sqrt((position[0] - robot_origin[0])**2 + 
+                                        (position[1] - robot_origin[1])**2)
+                workspace_score = 1.0 / (1.0 + workspace_distance * 2.0)
+                
+                # === ENHANCED ENERGY FUNCTION (lower is better) ===
+                energy = (
+                    -2.5 * base_score +                    # Grasp quality (most important)
+                    -1.0 * distance_score +                # Distance to robot
+                    3.0 * reach_penalty +                  # Reachability penalty
+                    -2.0 * height_score +                  # INCREASED: Height preference (more important)
+                    -2.5 * approach_score +                # Approach direction (very important)
+                    2.0 * approach_penalty +               # NEW: Penalty for non-upward approaches
+                    0.8 * orientation_penalty +            # Orientation stability
+                    -0.5 * object_proximity_score +        # Object proximity
+                    -3.0 * collision_score +               # INCREASED: Collision avoidance (more important)
+                    -1.0 * workspace_score                 # Workspace preference
+                )
+                
+                # Debug output for first few grasps
+                if original_idx < 3:
+                    print(f"  [EVAL] Grasp {original_idx+1}:")
+                    print(f"    Position: [{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}]")
+                    print(f"    Actual approach dir: {actual_approach_direction}")
+                    print(f"    Approach alignment: {approach_alignment:.3f} (score: {approach_score:.3f})")
+                    print(f"    Approach penalty: {approach_penalty:.3f}")
+                    print(f"    Distance to base: {distance_to_base:.3f}m (score: {distance_score:.3f})")
+                    print(f"    Height: {position[2]:.3f}m (score: {height_score:.3f})")
+                    print(f"    Base score: {base_score:.6f}")
+                    print(f"    Total energy: {energy:.4f}")
+                
+                if energy < best_energy:
+                    best_energy = energy
+                    best_grasp = grasp_data.copy()
+                    best_grasp['selection_info'] = {
+                        'total_energy': energy,
+                        'base_score': base_score,
+                        'distance_to_base': distance_to_base,
+                        'height': position[2],
+                        'approach_alignment': approach_alignment,
+                        'approach_penalty': approach_penalty,
+                        'actual_approach_direction': actual_approach_direction.tolist(),
+                        'orientation_penalty': orientation_penalty,
+                        'workspace_score': workspace_score,
+                        'rank': original_idx + 1
+                    }
+            
+            except Exception as e:
+                print(f"Error evaluating grasp {original_idx+1}: {e}")
+                continue
+        
+        if best_grasp:
+            info = best_grasp['selection_info']
+            print(f"\n🎯 SELECTED BEST GRASP:")
+            print(f"   Original rank: {info['rank']}")
+            print(f"   Total energy: {info['total_energy']:.4f}")
+            print(f"   Base score: {info['base_score']:.4f}")
+            print(f"   Distance to robot base: {info['distance_to_base']:.3f}m")
+            print(f"   Height: {info['height']:.3f}m")
+            print(f"   Approach alignment: {info['approach_alignment']:.3f}")
+            print(f"   Approach penalty: {info.get('approach_penalty', 0.0):.3f}")
+            print(f"   Actual approach direction: {info['actual_approach_direction']}")
+            print(f"   Workspace score: {info['workspace_score']:.3f}")
+            
+            # Show final pose
+            best_pose = best_grasp['pose']
+            pos = best_pose[:3, 3]
+            euler = R.from_matrix(best_pose[:3, :3]).as_euler('xyz')
+            print(f"   FINAL POSITION: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+            print(f"   FINAL ORIENTATION: [{euler[0]:.3f}, {euler[1]:.3f}, {euler[2]:.3f}] rad")
+            
+            # NEW: Verify the selected grasp is safe
+            approach_dir = np.array(info['actual_approach_direction'])
+            if pos[2] > table_height + 0.02 and approach_dir[2] >= -0.5:
+                print(f"   ✅ SAFETY CHECK PASSED: Grasp is above table and not approaching from below")
+            else:
+                print(f"   ⚠️  WARNING: Selected grasp may have safety issues!")
+        
+        return best_grasp
+
+    # Also add this method to the SuperquadricGraspPlanner class
+    def plan_grasps_with_best_selection(self, point_cloud_path, shape, scale, euler, translation, max_grasps=5):
+        """
+        Enhanced plan_grasps that includes intelligent best grasp selection
+        
+        Returns:
+            Tuple: (all_grasp_data, best_grasp_data)
+        """
+        # Get all diverse grasps using existing method
+        all_grasp_data = self.plan_grasps(point_cloud_path, shape, scale, euler, translation, max_grasps)
+        
+        if not all_grasp_data:
+            return [], None
+        
+        # Select the best grasp using multi-criteria
+        object_center = np.mean([data['translation'] for data in all_grasp_data], axis=0)
+        best_grasp_data = self.select_best_grasp_with_criteria(all_grasp_data, object_center)
+        
+        return all_grasp_data, best_grasp_data
+
+    def visualize_multi_sq_grasps(self, points, superquadrics, all_grasps_data, 
+                                 window_name="Multi-Superquadric Grasps", 
+                                 highlight_final=True, final_count=15):
+        """
+        Visualize multiple superquadrics with their grasps using existing gripper visualization
+        
+        Args:
+            points: object point cloud (Nx3)
+            superquadrics: list of Superquadric objects (our S objects)
+            all_grasps_data: list of dicts with keys ['pose', 'sq_index', 'score', 'is_final']
+            window_name: visualization window name
+            highlight_final: whether to highlight final selected grasps
+            final_count: number of final grasps to highlight
+        """
+        try:
+            # Create point cloud
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+            pcd.paint_uniform_color([0.7, 0.7, 0.7])  # Gray
+            geometries = [pcd]
+            
+            # Colors for superquadrics and grippers
+            colors = [
+                [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 0.0],
+                [1.0, 0.0, 1.0], [0.0, 1.0, 1.0], [1.0, 0.5, 0.0], [0.5, 0.0, 1.0]
+            ]
+            
+            # Add superquadric surface points - NOW WE CAN USE S OBJECTS DIRECTLY!
+            for i, S in enumerate(superquadrics):
+                try:
+                    # Use existing surface sampling with S objects (has ε1, ε2, etc.)
+                    sq_surface_points = sample_superquadric_surface(S, n_samples=2000)
+                    if len(sq_surface_points) > 0:
+                        sq_pcd = o3d.geometry.PointCloud()
+                        sq_pcd.points = o3d.utility.Vector3dVector(sq_surface_points)
+                        color = colors[i % len(colors)]
+                        sq_pcd.paint_uniform_color(color)
+                        geometries.append(sq_pcd)
+                        print(f"Added superquadric {i+1} visualization with {len(sq_surface_points)} surface points")
+                    else:
+                        print(f"No surface points generated for superquadric {i+1}")
+                except Exception as e:
+                    print(f"Failed to visualize superquadric {i+1}: {e}")
+                    # Add a simple marker for failed superquadrics
+                    try:
+                        center = S.T  # S objects have .T attribute
+                        marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
+                        marker.translate(center)
+                        color = colors[i % len(colors)]
+                        marker.paint_uniform_color(color)
+                        geometries.append(marker)
+                        print(f"Added marker for superquadric {i+1} at {center}")
+                    except Exception as marker_error:
+                        print(f"Failed to add marker for superquadric {i+1}: {marker_error}")
+            
+            # Add grasps using EXISTING gripper mesh approach
+            for i, grasp_data in enumerate(all_grasps_data):
+                try:
+                    grasp_pose = grasp_data['pose']
+                    sq_index = grasp_data.get('sq_index', 0)
+                    is_final = grasp_data.get('is_final', False)
+                    score = grasp_data.get('score', 0.0)
+                    
+                    # Use color based on superquadric
+                    base_color = colors[sq_index % len(colors)]
+                    
+                    # FIXED: Only highlight final grasps if highlight_final is True
+                    if highlight_final and is_final and i < final_count:
+                        if i == 0:  # Best grasp
+                            gripper_color = (1.0, 0.0, 0.0)  # Bright red for best
+                        else:
+                            gripper_color = tuple(base_color)  # Keep SQ color for other finals
+                    elif highlight_final and not is_final:
+                        # Make non-final grasps more transparent/muted when highlighting is enabled
+                        gripper_color = tuple(c * 0.6 for c in base_color)
+                    else:
+                        # FIXED: When highlight_final=False, use full base color for ALL grasps
+                        gripper_color = tuple(base_color)
+                    
+                    # Use EXISTING gripper mesh generation from THIS class
+                    gripper_meshes = self.gripper.make_open3d_meshes(colour=gripper_color)
+                    
+                    # Transform all gripper meshes to the grasp pose
+                    for mesh in gripper_meshes:
+                        mesh.transform(grasp_pose)
+                        geometries.append(mesh)
+                    
+                    # FIXED: Coordinate frame size logic
+                    if highlight_final and is_final and i == 0:
+                        frame_size = 0.03  # Large frame for best grasp when highlighting
+                    elif highlight_final and is_final:
+                        frame_size = 0.02  # Medium frame for other final grasps when highlighting
+                    else:
+                        frame_size = 0.015  # Small frame for all others (or when not highlighting)
+                    
+                    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=frame_size)
+                    coord_frame.transform(grasp_pose)
+                    geometries.append(coord_frame)
+                    
+                    # FIXED: Logging logic
+                    pos = grasp_pose[:3, 3]
+                    if highlight_final and is_final and i < 5:  # Only log final grasps when highlighting
+                        marker = "★" if i == 0 else "→"
+                        print(f"  {marker} Final grasp {i+1}: SQ{sq_index+1}, score={score:.6f}, pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+                    elif not highlight_final and i < 5:  # Log first few grasps when not highlighting
+                        print(f"  → Grasp {i+1}: SQ{sq_index+1}, score={score:.6f}, pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}], rotation={grasp_pose[:3, :3].tolist()}")
+                    
+                except Exception as e:
+                    print(f"Failed to visualize grasp {i+1}: {e}")
+            
+            # Add main coordinate frame
+            main_coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
+            geometries.append(main_coord_frame)
+            
+            # Create informative window title
+            final_grasps = sum(1 for g in all_grasps_data if g.get('is_final', False))
+            total_grasps = len(all_grasps_data)
+            title = f"{window_name} ({len(superquadrics)} SQs, {final_grasps}/{total_grasps} grasps)"
+            
+            print(f"Showing visualization: {len(superquadrics)} superquadrics, {total_grasps} total grasps, {final_grasps} final")
+            
+            # Show visualization
+            o3d.visualization.draw_geometries(
+                geometries,
+                window_name=title,
+                zoom=0.7,
+                front=[0, -1, 0],
+                lookat=np.mean(points, axis=0),
+                up=[0, 0, 1]
+            )
+            
+            # Print legend
+            print(f"\n{'='*60}")
+            print(f"MULTI-SUPERQUADRIC GRASPS VISUALIZATION:")
+            print(f"{'='*60}")
+            print(f"  🟫 Gray points: Object point cloud")
+            for i, S in enumerate(superquadrics):
+                color = colors[i % len(colors)]
+                print(f"  🟦 SQ {i+1}: RGB{color} - Surface points")
+            if highlight_final:
+                print(f"  🔴 Red gripper: BEST final grasp")
+                print(f"  🟨 Colored grippers: Other final grasps (colored by source SQ)")
+                print(f"  🌫️  Muted grippers: Non-final grasps")
+            else:
+                print(f"  🤖 Colored grippers: All grasps (colored by source SQ)")
+            print(f"{'='*60}")
+            
+        except Exception as e:
+            print(f"Multi-SQ visualization error: {e}")
+            import traceback
+            traceback.print_exc()
+   

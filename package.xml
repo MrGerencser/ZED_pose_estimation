@@ -12,6 +12,8 @@
   <depend>geometry_msgs</depend>
   <depend>std_msgs</depend>
   <depend>cv_bridge</depend>
+  <depend>scipy</depend>
+  <depend>scikit-learn</depend>
 
   <depend>numpy</depend>
   <depend>open3d</depend>

@@ -13,7 +13,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Bool
 from rclpy.executors import MultiThreadedExecutor
 import sensor_msgs_py.point_cloud2 as pc2
 from ultralytics import YOLO
@@ -25,6 +25,12 @@ from scipy.spatial.transform import Rotation as R_simple
 from scipy.spatial import KDTree
 from sklearn.cluster import KMeans
 import traceback
+
+import threading
+import json
+import os
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import socketserver
 
 from zed_pose_estimation.vis2 import visualize_superquadric_grasps
 
@@ -52,11 +58,13 @@ class ZedGpuNode(Node):
             os.path.dirname(os.path.abspath(__file__)), '..', 'config', 'transform.yaml'))
         
         # Superquadric parameters
+        self.declare_parameter('poisson_reconstruction', False)  # Default False: use basic pointcloud filtering
+        self.declare_parameter('use_kmeans_clustering', False)  # Default False: single global SQ
         self.declare_parameter('superquadric_enabled', True)
         self.declare_parameter('gripper_jaw_length', 0.041)  # meters
         self.declare_parameter('gripper_max_opening', 0.08)   # meters
         self.declare_parameter('outlier_ratio', 0.9)         # EMS parameter
-        self.declare_parameter('publish_tf', True)
+        self.declare_parameter('visualize_yolo', True)
         self.declare_parameter('visualize', True)
         
         # Get parameters
@@ -73,11 +81,13 @@ class ZedGpuNode(Node):
         self.transform_file_path = self.get_parameter('transform_file_path').get_parameter_value().string_value
         
         # Get superquadric parameters
+        self.poisson_reconstruction = self.get_parameter('poisson_reconstruction').get_parameter_value().bool_value
+        self.use_kmeans_clustering = self.get_parameter('use_kmeans_clustering').get_parameter_value().bool_value
         self.superquadric_enabled = self.get_parameter('superquadric_enabled').get_parameter_value().bool_value
         self.gripper_jaw_length = self.get_parameter('gripper_jaw_length').get_parameter_value().double_value
         self.gripper_max_opening = self.get_parameter('gripper_max_opening').get_parameter_value().double_value
         self.outlier_ratio = self.get_parameter('outlier_ratio').get_parameter_value().double_value
-        self.publish_tf = self.get_parameter('publish_tf').get_parameter_value().bool_value
+        self.visualize_yolo = self.get_parameter('visualize_yolo').get_parameter_value().bool_value
         self.visualize = self.get_parameter('visualize').get_parameter_value().bool_value
         
         # Initialize superquadric grasp planner if enabled
@@ -110,10 +120,7 @@ class ZedGpuNode(Node):
             "Superquadric Grasp Generation": [],
             "Total Time": []
         }
-        
-        # Setup visualization window if enabled
-        if self.publish_viz:
-            cv2.namedWindow("YOLO Detection")
+    
         
         # FPS calculation
         self.fps_values = []
@@ -124,8 +131,6 @@ class ZedGpuNode(Node):
         
         # Setup TF broadcaster and pose publisher
         self.pose_publisher = self.create_publisher(PoseStamped, '/perception/object_pose', 10)
-        if self.publish_tf:
-            self.tf_broadcaster = TransformBroadcaster(self)
         
         # Initialize ZED cameras
         self.get_logger().info("Initializing ZED cameras...")
@@ -141,6 +146,27 @@ class ZedGpuNode(Node):
         self.fused_objects_publisher = self.create_publisher(
             PointCloud2, '/perception/fused_objects_cloud', 10)
         
+        # Add execution state tracking
+        self.grasp_executing = False
+        
+        # Subscribe to grasp execution state
+        self.execution_state_subscriber = self.create_subscription(
+            Bool, '/robot/grasp_executing',
+            self.grasp_execution_callback, 10
+        )
+        
+        # Web-based live visualization setup with separate capture
+        self.web_enabled = self.visualize_yolo
+        self.live_capture_enabled = False
+        self.web_server_thread = None
+        self.live_capture_thread = None
+        self.latest_web_frame = None
+        self.web_frame_lock = threading.Lock()
+        
+        if self.web_enabled:
+            self._setup_web_server()
+            self._start_live_capture()
+        
         # Set up timer for processing
         self.timer = self.create_timer(1.0/self.processing_rate, self.process_frames)
         self.get_logger().info(f"ZED GPU Node initialized, processing at {self.processing_rate}Hz")
@@ -154,7 +180,7 @@ class ZedGpuNode(Node):
         # Set the initialization parameters for camera 1
         init_params1 = sl.InitParameters()
         init_params1.set_from_serial_number(self.camera1_sn)
-        init_params1.camera_resolution = sl.RESOLUTION.HD2K
+        init_params1.camera_resolution = sl.RESOLUTION.HD720
         init_params1.camera_fps = 10
         init_params1.depth_mode = sl.DEPTH_MODE.NEURAL
         init_params1.depth_minimum_distance = 0.4
@@ -163,7 +189,7 @@ class ZedGpuNode(Node):
         # Set the initialization parameters for camera 2
         init_params2 = sl.InitParameters()
         init_params2.set_from_serial_number(self.camera2_sn)
-        init_params2.camera_resolution = sl.RESOLUTION.HD2K
+        init_params2.camera_resolution = sl.RESOLUTION.HD720
         init_params2.camera_fps = 10
         init_params2.depth_mode = sl.DEPTH_MODE.NEURAL
         init_params2.depth_minimum_distance = 0.4
@@ -293,21 +319,31 @@ class ZedGpuNode(Node):
             # Step 4: Run YOLO detection
             results1, results2, class_ids1, class_ids2 = self._run_yolo_detection([frame1, frame2])
             
-            # Step 5: Extract object point clouds from detections
+            # # Step 5: Update web display immediately after YOLO (non-blocking)
+            # if self.web_enabled:
+            #     self._update_web_display(frame1, frame2, results1, results2)
+            
+            # Step 6: Extract object point clouds from detections
             fused_object_points, fused_object_classes, fused_objects_np = self._extract_object_point_clouds(
                 results1, results2, class_ids1, class_ids2, depth_np1, depth_np2
             )
 
-            # Step 6: Generate grasps using superquadric fitting
+            # Step 7: Generate grasps using superquadric fitting
             if self.superquadric_enabled and fused_object_points:
                 self._process_superquadric_grasps(fused_object_points, fused_object_classes, fused_workspace_np)
             
-            # Step 7: Publish point clouds
+            # Step 8: Publish point clouds
             self._publish_point_clouds(fused_workspace_np, fused_objects_np)
             
-            # Step 8: Update visualization and FPS
-            self._update_visualization_and_fps(frame1, frame2, results1, results2, start_time)
+            # Step 9: Update FPS calculation
+            total_time = time.time() - start_time
+            self.timings["Total Time"].append(total_time)
+            fps = 1.0 / total_time
+            self.fps_values.append(fps)
             
+            if len(self.fps_values) > 10:
+                self.fps_values.pop(0)
+                
         except Exception as e:
             self.get_logger().error(f"Error in process_frames: {e}")
             self.get_logger().error(traceback.format_exc())
@@ -484,7 +520,18 @@ class ZedGpuNode(Node):
                         
                         if points_3d.size(0) > 0:
                             transformed = torch.mm(points_3d, self.rotation1_torch.T) + self.origin1_torch
-                            point_clouds_camera1.append((transformed.cpu().numpy(), int(class_ids1[i])))
+                            
+                            # EARLY WORKSPACE FILTER - CAMERA 1
+                            transformed_np = transformed.cpu().numpy()
+                            if self._is_object_in_workspace(transformed_np, coverage_threshold=0.3):
+                                point_clouds_camera1.append((transformed_np, int(class_ids1[i])))
+                            else:
+                                object_name = self.class_names.get(int(class_ids1[i]), f'Class_{int(class_ids1[i])}')
+                                object_center = np.mean(transformed_np, axis=0)
+                                self.get_logger().info(
+                                    f"[EARLY FILTER] Rejected {object_name} from camera 1 - "
+                                    f"center [{object_center[0]:.3f}, {object_center[1]:.3f}, {object_center[2]:.3f}] outside workspace"
+                                )
             
             # Process camera 2 masks
             if results2.masks is not None and results2.masks.data.numel() > 0:
@@ -502,9 +549,20 @@ class ZedGpuNode(Node):
                         
                         if points_3d.size(0) > 0:
                             transformed = torch.mm(points_3d, self.rotation2_torch.T) + self.origin2_torch
-                            point_clouds_camera2.append((transformed.cpu().numpy(), int(class_ids2[i])))
+                            
+                            # EARLY WORKSPACE FILTER - CAMERA 2
+                            transformed_np = transformed.cpu().numpy()
+                            if self._is_object_in_workspace(transformed_np, coverage_threshold=0.3):
+                                point_clouds_camera2.append((transformed_np, int(class_ids2[i])))
+                            else:
+                                object_name = self.class_names.get(int(class_ids2[i]), f'Class_{int(class_ids2[i])}')
+                                object_center = np.mean(transformed_np, axis=0)
+                                self.get_logger().info(
+                                    f"[EARLY FILTER] Rejected {object_name} from camera 2 - "
+                                    f"center [{object_center[0]:.3f}, {object_center[1]:.3f}, {object_center[2]:.3f}] outside workspace"
+                                )
             
-            # Fuse object point clouds
+            # Fuse object point clouds (now only workspace-valid objects)
             _, _, fused_objects = fuse_point_clouds_centroid(
                 point_clouds_camera1, point_clouds_camera2, self.distance_threshold
             )
@@ -524,11 +582,71 @@ class ZedGpuNode(Node):
             self.get_logger().error(f"Error extracting object point clouds: {e}")
             return [], [], np.empty((0, 3))
 
-
+    def _is_object_in_workspace(self, object_points, coverage_threshold=0.5):
+        """
+        Check if detected object is within workspace bounds
+        
+        Args:
+            object_points: numpy array of object points (Nx3)
+            coverage_threshold: minimum fraction of points that must be in workspace (0.0-1.0)
+            
+        Returns:
+            bool: True if object is sufficiently within workspace, False otherwise
+        """
+        try:
+            if len(object_points) == 0:
+                return False
+            
+            # Extract workspace bounds
+            x_min, x_max = self.workspace_bounds[0], self.workspace_bounds[1]
+            y_min, y_max = self.workspace_bounds[2], self.workspace_bounds[3]
+            z_min, z_max = self.workspace_bounds[4], self.workspace_bounds[5]
+            
+            # Check which points are within workspace bounds
+            x_in_bounds = (object_points[:, 0] >= x_min) & (object_points[:, 0] <= x_max)
+            y_in_bounds = (object_points[:, 1] >= y_min) & (object_points[:, 1] <= y_max)
+            z_in_bounds = (object_points[:, 2] >= z_min) & (object_points[:, 2] <= z_max)
+            
+            # Points are in workspace if they satisfy all three bounds
+            points_in_workspace = x_in_bounds & y_in_bounds & z_in_bounds
+            
+            # Calculate coverage
+            coverage = np.sum(points_in_workspace) / len(object_points)
+            
+            # Check object center position as well
+            object_center = np.mean(object_points, axis=0)
+            center_in_workspace = (
+                x_min <= object_center[0] <= x_max and
+                y_min <= object_center[1] <= y_max and
+                z_min <= object_center[2] <= z_max
+            )
+            
+            # Object is valid if either:
+            # 1. Center is in workspace AND sufficient point coverage
+            # 2. Very high point coverage (even if center is slightly outside)
+            is_valid = (center_in_workspace and coverage >= coverage_threshold) or (coverage >= 0.8)
+            
+            # Log detailed info for debugging
+            if not is_valid:
+                self.get_logger().debug(
+                    f"Object rejected: center=[{object_center[0]:.3f}, {object_center[1]:.3f}, {object_center[2]:.3f}], "
+                    f"coverage={coverage:.3f}, workspace=[{x_min:.3f}-{x_max:.3f}, {y_min:.3f}-{y_max:.3f}, {z_min:.3f}-{z_max:.3f}]"
+                )
+            
+            return is_valid
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in workspace bounds check: {e}")
+            return False  # Conservative: reject if check fails
 
     def _process_superquadric_grasps(self, fused_object_points, fused_object_classes, fused_workspace_np):
         """Process objects for superquadric fitting and grasp generation"""
         try:
+            # EARLY EXIT if grasp is executing
+            if self.grasp_executing:
+                self.get_logger().info("Skipping grasp generation - robot is executing grasp")
+                return
+            
             grasp_start = time.time()
 
             graspable_classes = [0, 1, 2, 3, 4]  # Cone, Cup, Mallet, Screw Driver, Sunscreen
@@ -601,7 +719,7 @@ class ZedGpuNode(Node):
             pose_msg.header.frame_id = self.target_frame
             pose_msg.pose.position.x = float(pos[0])
             pose_msg.pose.position.y = float(pos[1])
-            pose_msg.pose.position.z = float(pos[2]) + 0.01  # Slight offset to avoid collision
+            pose_msg.pose.position.z = float(pos[2]) 
             pose_msg.pose.orientation.x = float(quat[0])
             pose_msg.pose.orientation.y = float(quat[1])
             pose_msg.pose.orientation.z = float(quat[2])
@@ -761,31 +879,7 @@ class ZedGpuNode(Node):
                     
         except Exception as e:
             self.get_logger().error(f"Error updating visualization and FPS: {e}")
-
-    def preprocess_point_cloud(self, pcd):
-        """Preprocess point cloud for superquadric fitting"""
-        try:
-            pcd_down = pcd.voxel_down_sample(voxel_size=self.voxel_size)
-
-            if len(np.asarray(pcd_down.points)) > 50:
-                pcd_down, _ = pcd_down.remove_statistical_outlier(
-                    nb_neighbors=20,
-                    std_ratio=2.0
-                )
-
-            if not pcd_down.has_normals():
-                pcd_down.estimate_normals(
-                    search_param=o3d.geometry.KDTreeSearchParamHybrid(
-                        radius=self.voxel_size * 2,
-                        max_nn=30
-                    )
-                )
-
-            return pcd_down
-
-        except Exception as e:
-            self.get_logger().error(f"Error in preprocess_point_cloud: {e}")
-            return pcd
+    
 
     def calculate_k_superquadrics(self, point_count):
         """
@@ -941,106 +1035,158 @@ class ZedGpuNode(Node):
             
             self.get_logger().info(f"Point cloud stats: center={points_center}, std={points_std}")
             
-            # STEP 1: Parse point set X into K parts via K-means (EXACT as paper)
-            
-            if K is None:
-                K = self.calculate_k_superquadrics(len(points_for_ems))
-            
-            K = 1
-            self.get_logger().info(f"Using K={K} clusters")
-            
-            # K-means clustering to get {Φ1, Φ2, ..., ΦK}
-            kmeans = KMeans(n_clusters=K, random_state=42, n_init=10)
-            cluster_labels = kmeans.fit_predict(points_for_ems)
-
-            # STEP 2: Initialize K+1 ellipsoids with improved validation
-            initial_ellipsoids = []
-            
-            # For each subset Φi, initialize ellipsoid θi with validation
-            for i in range(K):
-                cluster_points = points_for_ems[cluster_labels == i]
+            # BRANCH: Choose between single SQ or K-means based on parameter
+            if not self.use_kmeans_clustering:
+                # SIMPLIFIED: Just fit ONE superquadric to the entire point cloud
+                self.get_logger().info("Using single global superquadric (no K-means clustering)")
                 
-                # Validate cluster size and properties
-                if len(cluster_points) < 50:  # Increased minimum threshold
-                    self.get_logger().warn(f"Cluster {i} too small ({len(cluster_points)} points), skipping")
-                    continue
+                # Center the points for EMS
+                centered_points = points_for_ems - points_center
                 
-                cluster_center = np.mean(cluster_points, axis=0)
-                cluster_std = np.std(cluster_points, axis=0)
+                # Additional validation before EMS
+                point_span = np.max(centered_points, axis=0) - np.min(centered_points, axis=0)
+                if np.any(point_span < 1e-6):
+                    self.get_logger().warn("Degenerate point span, cannot fit superquadric")
+                    return None, []
                 
-                # Check cluster validity
-                if np.any(cluster_std < 1e-6):
-                    self.get_logger().warn(f"Cluster {i} degenerate (std={cluster_std}), skipping")
-                    continue
+                self.get_logger().info(f"Centered points span: {point_span}")
                 
-                # In the cluster processing loop, replace the MoI calculation section:
                 try:
-                    # Calculate MoI for this cluster subset Φi
-                    cluster_moi = self.calculate_moment_of_inertia(cluster_points)
+                    # Single EMS call for the entire point cloud
+                    self.get_logger().info("Fitting single superquadric to entire point cloud...")
+                    sq_candidate, probabilities = EMS_recovery(
+                        centered_points,
+                        # Let EMS use its default initialization
+                        OutlierRatio=self.outlier_ratio,
+                        MaxIterationEM=60,
+                        ToleranceEM=1e-3,
+                        RelativeToleranceEM=1e-1,
+                        MaxOptiIterations=5,
+                        Sigma=0.02,
+                        MaxiSwitch=1,
+                        AdaptiveUpperBound=True,
+                        Rescale=True
+                    )
                     
-                    # Validate MoI eigenvalues
-                    eigenvals, eigenvecs = np.linalg.eigh(cluster_moi)
-                    if np.any(eigenvals <= 1e-12):
-                        self.get_logger().warn(f"Cluster {i} invalid MoI eigenvals={eigenvals}, using default")
-                        # Use default initialization based on cluster bounds
-                        cluster_bounds = np.max(cluster_points, axis=0) - np.min(cluster_points, axis=0)
-                        scale = cluster_bounds / 4.0  # Conservative scale
-                        rotation_matrix = np.eye(3)  # Identity rotation
+                    # Translate back to world coordinates
+                    sq_candidate.translation = sq_candidate.translation + points_center
+                    
+                    # Validate the result
+                    if self._validate_superquadric_strict(sq_candidate, points_for_ems):
+                        fitted_superquadrics = [sq_candidate]
+                        
+                        coverage = self._evaluate_sq_coverage(sq_candidate, points_for_ems)
+                        self.get_logger().info(f"SUCCESS: Single SQ coverage={coverage:.3f}")
+                        self.get_logger().info(f"  Final SQ: Center={sq_candidate.translation}, Scale={sq_candidate.scale}")
+                        
+                        return sq_candidate, fitted_superquadrics
                     else:
-                        # Initialize ellipsoid with MoI = cluster_MoI / 2 (EXACT as paper)
-                        ellipsoid_params = self.moi_to_ellipsoid_params(cluster_moi / 2.0)
-                        scale = ellipsoid_params['scale']
-                        rotation_matrix = ellipsoid_params['rotation']
+                        self.get_logger().warn("Single superquadric failed validation")
+                        return None, []
+                        
+                except Exception as e:
+                    self.get_logger().error(f"Failed to fit single superquadric: {e}")
+                    return None, []
+            
+            else:
+                # ORIGINAL K-MEANS METHOD: Keep all existing code exactly the same
+                if K is None:
+                    K = self.calculate_k_superquadrics(len(points_for_ems))
+                
+                self.get_logger().info(f"Using K-means clustering with K={K} clusters")
+            
+                # K-means clustering to get {Φ1, Φ2, ..., ΦK}
+                kmeans = KMeans(n_clusters=K, random_state=42, n_init=10)
+                cluster_labels = kmeans.fit_predict(points_for_ems)
+
+                # STEP 2: Initialize K+1 ellipsoids with improved validation
+                initial_ellipsoids = []
+                
+                # For each subset Φi, initialize ellipsoid θi with validation
+                for i in range(K):
+                    cluster_points = points_for_ems[cluster_labels == i]
                     
-                    # Validate and clamp scale values
-                    scale = np.clip(scale, 0.005, 0.2)  # Reasonable bounds: 5mm to 20cm
+                    # Validate cluster size and properties
+                    if len(cluster_points) < 50:  # Increased minimum threshold
+                        self.get_logger().warn(f"Cluster {i} too small ({len(cluster_points)} points), skipping")
+                        continue
+                    
+                    cluster_center = np.mean(cluster_points, axis=0)
+                    cluster_std = np.std(cluster_points, axis=0)
+                    
+                    # Check cluster validity
+                    if np.any(cluster_std < 1e-6):
+                        self.get_logger().warn(f"Cluster {i} degenerate (std={cluster_std}), skipping")
+                        continue
+                    
+                    # In the cluster processing loop, replace the MoI calculation section:
+                    try:
+                        # Calculate MoI for this cluster subset Φi
+                        cluster_moi = self.calculate_moment_of_inertia(cluster_points)
+                        
+                        # Validate MoI eigenvalues
+                        eigenvals, eigenvecs = np.linalg.eigh(cluster_moi)
+                        if np.any(eigenvals <= 1e-12):
+                            self.get_logger().warn(f"Cluster {i} invalid MoI eigenvals={eigenvals}, using default")
+                            # Use default initialization based on cluster bounds
+                            cluster_bounds = np.max(cluster_points, axis=0) - np.min(cluster_points, axis=0)
+                            scale = cluster_bounds / 4.0  # Conservative scale
+                            rotation_matrix = np.eye(3)  # Identity rotation
+                        else:
+                            # Initialize ellipsoid with MoI = cluster_MoI / 2 (EXACT as paper)
+                            ellipsoid_params = self.moi_to_ellipsoid_params(cluster_moi / 2.0)
+                            scale = ellipsoid_params['scale']
+                            rotation_matrix = ellipsoid_params['rotation']
+                        
+                        # Validate and clamp scale values
+                        scale = np.clip(scale, 0.005, 0.2)  # Reasonable bounds: 5mm to 20cm
+                        
+                        initial_ellipsoids.append({
+                            'translation': cluster_center,
+                            'scale': scale,
+                            'shape': [1.0, 1.0],  # Ellipsoid (ε1=1, ε2=1)
+                            'rotation': rotation_matrix,
+                            'subset': cluster_points,
+                            'type': f'cluster_{i}'
+                        })
+                        
+                        self.get_logger().info(f"Cluster {i}: center={cluster_center}, scale={scale}, det={np.linalg.det(rotation_matrix):.6f}")
+                        
+                    except Exception as cluster_error:
+                        self.get_logger().warn(f"Failed to initialize cluster {i}: {cluster_error}")
+                        continue
+                
+                # STEP 3: Add extra ellipsoid θextra for whole point set X with validation
+                try:
+                    global_center = np.mean(points_for_ems, axis=0)
+                    
+                    # Calculate MoI for the ENTIRE point set X
+                    global_moi = self.calculate_moment_of_inertia(points_for_ems)
+                    
+                    # Initialize ellipsoid with MoI = global_MoI / 2 (EXACT as paper)
+                    global_ellipsoid_params = self.moi_to_ellipsoid_params(global_moi / 2.0)
+                    global_scale = global_ellipsoid_params['scale']
+                    
+                    # Validate and clamp scale values (optional safety)
+                    global_scale = np.clip(global_scale, 0.01, 0.3)
                     
                     initial_ellipsoids.append({
-                        'translation': cluster_center,
-                        'scale': scale,
-                        'shape': [1.0, 1.0],  # Ellipsoid (ε1=1, ε2=1)
-                        'rotation': rotation_matrix,
-                        'subset': cluster_points,
-                        'type': f'cluster_{i}'
+                        'translation': global_center,
+                        'scale': global_scale,
+                        'shape': [1.0, 1.0],
+                        'rotation': global_ellipsoid_params['rotation'],  # Use MoI-derived rotation
+                        'subset': points_for_ems,
+                        'type': 'global_extra'
                     })
                     
-                    self.get_logger().info(f"Cluster {i}: center={cluster_center}, scale={scale}, det={np.linalg.det(rotation_matrix):.6f}")
+                    self.get_logger().info(f"Global ellipsoid (MoI/2): center={global_center}, scale={global_scale}")
                     
-                except Exception as cluster_error:
-                    self.get_logger().warn(f"Failed to initialize cluster {i}: {cluster_error}")
-                    continue
-            
-            # STEP 3: Add extra ellipsoid θextra for whole point set X with validation
-            try:
-                global_center = np.mean(points_for_ems, axis=0)
+                except Exception as global_error:
+                    self.get_logger().warn(f"Failed to initialize global ellipsoid: {global_error}")
                 
-                # Calculate MoI for the ENTIRE point set X
-                global_moi = self.calculate_moment_of_inertia(points_for_ems)
-                
-                # Initialize ellipsoid with MoI = global_MoI / 2 (EXACT as paper)
-                global_ellipsoid_params = self.moi_to_ellipsoid_params(global_moi / 2.0)
-                global_scale = global_ellipsoid_params['scale']
-                
-                # Validate and clamp scale values (optional safety)
-                global_scale = np.clip(global_scale, 0.01, 0.3)
-                
-                initial_ellipsoids.append({
-                    'translation': global_center,
-                    'scale': global_scale,
-                    'shape': [1.0, 1.0],
-                    'rotation': global_ellipsoid_params['rotation'],  # Use MoI-derived rotation
-                    'subset': points_for_ems,
-                    'type': 'global_extra'
-                })
-                
-                self.get_logger().info(f"Global ellipsoid (MoI/2): center={global_center}, scale={global_scale}")
-                
-            except Exception as global_error:
-                self.get_logger().warn(f"Failed to initialize global ellipsoid: {global_error}")
-            
-            if not initial_ellipsoids:
-                self.get_logger().error("No valid initial ellipsoids created")
-                return None, []
+                if not initial_ellipsoids:
+                    self.get_logger().error("No valid initial ellipsoids created")
+                    return None, []
             
             self.get_logger().info(f"Initialized {len(initial_ellipsoids)} valid ellipsoids")
             
@@ -1105,7 +1251,7 @@ class ZedGpuNode(Node):
                         self.get_logger().info(f"    Final SQ: Center={sq_candidate.translation}, Scale={sq_candidate.scale}")
                     else:
                         self.get_logger().warn(f"  REJECTED: Failed validation")
-                        
+                    
                 except Exception as e:
                     self.get_logger().warn(f"Failed to process ellipsoid {i+1}: {e}")
                     continue
@@ -1259,19 +1405,67 @@ class ZedGpuNode(Node):
             # =============================================================================
             self.get_logger().info(f"Processing object with {len(object_points)} points")
             
+            # Store original points BEFORE filtering
+            original_object_points = np.array(object_points)  # Keep reference to original
+            
             # Create and filter point cloud
             object_pcd = o3d.geometry.PointCloud()
             object_pcd.points = o3d.utility.Vector3dVector(object_points)
-            object_pcd = self.preprocess_point_cloud(object_pcd)
-            object_pcd = object_pcd.remove_statistical_outlier(nb_neighbors=50, std_ratio=0.4)[0]
+            object_pcd, outlier_indices = object_pcd.remove_statistical_outlier(
+                nb_neighbors=20, 
+                std_ratio=1.0
+            )
+
+            # Stage 2: Remove radius-based outliers
+            object_pcd, _ = object_pcd.remove_radius_outlier(
+                nb_points=16,      # Minimum neighbors within radius
+                radius=0.05      # Tight radius for noise removal
+            )
+
+            object_pcd = object_pcd.voxel_down_sample(voxel_size=0.002)  # Downsample for efficiency
+
+            if self.poisson_reconstruction:
+                # =============================================================================
+                # STEP 3: Estimate normals before Poisson reconstruction
+                self.get_logger().info("Estimating surface normals for Poisson reconstruction...")
+                object_pcd.estimate_normals(
+                    search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                        radius=0.01,  # Search radius for normal estimation
+                        max_nn=30     # Maximum number of neighbors
+                    )
+                )
+
+                # Orient normals consistently (important for Poisson reconstruction)
+                object_pcd.orient_normals_consistent_tangent_plane(k=15)
+
+                # STEP 4: Mesh reconstruction and smoothing
+                self.get_logger().info("Performing Poisson surface reconstruction...")
+                mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                    object_pcd, depth=8, width=0, scale=1.1, linear_fit=False
+                )
+
+                # Optional: Remove low-density vertices (often noise)
+                if len(densities) > 0:
+                    density_threshold = np.quantile(densities, 0.01)  # Remove bottom 1%
+                    vertices_to_remove = np.where(np.array(densities) < density_threshold)[0]
+                    mesh.remove_vertices_by_index(vertices_to_remove)
+
+                # Smooth the mesh
+                mesh = mesh.filter_smooth_simple(number_of_iterations=1)
+
+                # STEP 5: Sample back to point cloud
+                self.get_logger().info("Sampling points from reconstructed mesh...")
+                object_pcd = mesh.sample_points_poisson_disk(
+                    number_of_points=len(object_pcd.points))
             
             # Validate sufficient points remain
             if len(object_pcd.points) < 100:
                 self.get_logger().warn(f"Too few points after preprocessing: {len(object_pcd.points)}")
                 return []
             
-            object_points = np.asarray(object_pcd.points)
-            object_center = np.mean(object_points, axis=0)
+            # Get filtered points
+            filtered_object_points = np.asarray(object_pcd.points)
+            object_center = np.mean(filtered_object_points, axis=0)
             self.get_logger().info(f"Object center: {object_center}")
             
             # Save temporary file for grasp planner
@@ -1279,27 +1473,33 @@ class ZedGpuNode(Node):
             o3d.io.write_point_cloud(temp_file, object_pcd)
             
             # =============================================================================
-            # STEP 2: OPTIONAL INPUT VISUALIZATION
+            # STEP 2: CORRECTED VISUALIZATION (TRUE BEFORE/AFTER)
             # =============================================================================
             if self.visualize:
-                detected_cloud = o3d.geometry.PointCloud()
-                detected_cloud.points = o3d.utility.Vector3dVector(object_points)
-                detected_cloud.paint_uniform_color([1, 0, 0])  # Red
+                # Show TRUE before/after comparison
+                original_pcd = o3d.geometry.PointCloud()
+                original_pcd.points = o3d.utility.Vector3dVector(original_object_points)  # Original noisy points
+                original_pcd.paint_uniform_color([1, 0, 0])  # Red for original
+                
+                filtered_pcd = o3d.geometry.PointCloud()
+                filtered_pcd.points = o3d.utility.Vector3dVector(filtered_object_points)  # Filtered points
+                filtered_pcd.paint_uniform_color([0, 1, 0])  # Green for filtered
                 
                 coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
                 coord_frame.translate(object_center)
                 
+                # Show both point clouds together
                 o3d.visualization.draw_geometries(
-                    [detected_cloud, coord_frame],
-                    window_name=f"Detected Points - Class {class_id}",
+                    [original_pcd, filtered_pcd, coord_frame],
+                    window_name=f"Before/After Filtering - Class {class_id} (Original: {len(original_object_points)}, Filtered: {len(filtered_object_points)})",
                     zoom=0.7, front=[0, -1, 0], lookat=object_center, up=[0, 0, 1]
                 )
             
             # =============================================================================
-            # STEP 3: FIT MULTIPLE SUPERQUADRICS
+            # STEP 3: FIT MULTIPLE SUPERQUADRICS (use filtered points)
             # =============================================================================
             self.get_logger().info("Fitting multiple superquadrics...")
-            points_for_ems = np.asarray(object_pcd.points)
+            points_for_ems = filtered_object_points  # Use filtered points for EMS
             
             best_sq, all_valid_sqs = self.fit_multiple_superquadrics_ensemble(points_for_ems)
             
@@ -1327,20 +1527,33 @@ class ZedGpuNode(Node):
                     
                     consistent_euler = R_simple.from_matrix(sq_recovered.RotM).as_euler('xyz')
                     
-                    # Generate scored grasps for execution
-                    sq_grasp_data = self.grasp_planner.plan_grasps(
+                    # Generate grasps with intelligent selection
+                    all_sq_grasps, best_sq_grasp = self.grasp_planner.plan_grasps_with_best_selection(
                         temp_file, sq_recovered.shape, sq_recovered.scale,
                         consistent_euler, sq_recovered.translation
                     )
-                    
-                    # Generate all grasps for visualization
-                    all_grasp_data = self.grasp_planner.get_all_grasps(
-                        temp_file, sq_recovered.shape, sq_recovered.scale,
-                        consistent_euler, sq_recovered.translation
-                    )
-                    
-                    # Store visualization grasps
-                    for grasp_data in all_grasp_data:
+
+                    # Use the best_sq_grasp for execution and all_sq_grasps for visualization:
+                    if best_sq_grasp:
+                        execution_grasps['poses'].append(best_sq_grasp['pose'])
+                        execution_grasps['info'].append({
+                            'sq_index': i,
+                            'sq': sq_recovered,
+                            'euler': consistent_euler,
+                            'grasp_score': best_sq_grasp['score'],
+                            'selection_info': best_sq_grasp.get('selection_info', {}),
+                            'is_visualization': False
+                        })
+                        
+                        self.get_logger().info(f"  Selected BEST grasp with score: {best_sq_grasp['score']:.8f}")
+                        if 'selection_info' in best_sq_grasp:
+                            info = best_sq_grasp['selection_info']
+                            self.get_logger().info(f"    Energy: {info['total_energy']:.4f}, Rank: {info['rank']}")
+                    else:
+                        self.get_logger().warn(f"  No best grasp selected for SQ {i+1}")
+
+                    # Store all grasps for visualization
+                    for grasp_data in all_sq_grasps:
                         visualization_grasps['poses'].append(grasp_data['pose'])
                         visualization_grasps['info'].append({
                             'sq_index': i,
@@ -1349,29 +1562,8 @@ class ZedGpuNode(Node):
                             'grasp_score': grasp_data.get('score', 0.0),
                             'is_visualization': True
                         })
-                    
-                    self.get_logger().info(f"  Generated {len(all_grasp_data)} visualization grasps")
-                    
-                    # Store execution grasps
-                    if sq_grasp_data:
-                        poses = [data['pose'] for data in sq_grasp_data]
-                        scores = [data['score'] for data in sq_grasp_data]
-                        
-                        self.get_logger().info(f"  Generated {len(poses)} execution grasps")
-                        
-                        for pose, score in zip(poses, scores):
-                            execution_grasps['poses'].append(pose)
-                            execution_grasps['info'].append({
-                                'sq_index': i,
-                                'sq': sq_recovered,
-                                'euler': consistent_euler,
-                                'grasp_score': score,
-                                'is_visualization': False
-                            })
-                            
-                            self.get_logger().info(f"    Grasp score: {score:.8f}")
-                    else:
-                        self.get_logger().warn(f"  No execution grasps generated")
+
+                    self.get_logger().info(f"  Generated {len(all_sq_grasps)} total grasps for visualization")
                         
                 except Exception as sq_error:
                     self.get_logger().error(f"Error processing SQ {i+1}: {sq_error}")
@@ -1471,19 +1663,95 @@ class ZedGpuNode(Node):
                     f"final_score={best_final_score:.8f}"
                 )
             
-            # Final visualization
+            # Cleanup temporary file
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except Exception as cleanup_error:
+                self.get_logger().warn(f"Failed to cleanup temp file {temp_file}: {cleanup_error}")
+
+            # Visualize using the planner's method (now has access to proper S objects)
             if self.visualize and visualization_grasps['poses']:
                 try:
+                    # Convert node superquadrics to planner format
+                    planner_superquadrics = []
+                    for sq in all_valid_sqs:
+                        # Convert from node format to planner format
+                        from zed_pose_estimation.superquadric_grasp_planner import Superquadric
+                        
+                        euler_angles = R_simple.from_matrix(sq.RotM).as_euler('xyz')
+
+                        planner_sq = Superquadric(
+                            ε=sq.shape,         # [ε1, ε2]
+                            a=sq.scale,         # [ax, ay, az]
+                            euler=euler_angles,  # [roll, pitch, yaw]
+                            t=sq.translation    # [tx, ty, tz]
+                        )
+                        planner_superquadrics.append(planner_sq)
+                    
+                    # Prepare grasp data for multi-SQ visualization
+                    all_grasp_visualization_data = []
+                    final_pose_set = set()
+                    
+                    # Mark final poses for easy lookup
+                    for pose in final_grasp_poses:
+                        pose_key = tuple(pose.flatten())
+                        final_pose_set.add(pose_key)
+                    
+                    # Convert visualization grasps to required format
+                    for pose, sq_info in zip(visualization_grasps['poses'], visualization_grasps['info']):
+                        pose_key = tuple(pose.flatten())
+                        is_final = pose_key in final_pose_set
+                        
+                        all_grasp_visualization_data.append({
+                            'pose': pose,
+                            'sq_index': sq_info['sq_index'],
+                            'score': sq_info.get('grasp_score', 0.0),
+                            'is_final': is_final
+                        })
+                    
+                    # 1. Show ALL generated grasps using planner's method
                     self.get_logger().info(
-                        f"Visualizing {len(visualization_grasps['poses'])} grasps "
-                        f"from {len(all_valid_sqs)} superquadrics"
+                        f"Visualizing ALL {len(all_grasp_visualization_data)} grasps "
+                        f"from {len(planner_superquadrics)} superquadrics"
                     )
-                    self.visualize_multi_superquadric_grasps(
+                    self.grasp_planner.visualize_multi_sq_grasps(
                         points_for_ems,
-                        all_valid_sqs,
-                        visualization_grasps['poses'],
-                        visualization_grasps['info']
+                        planner_superquadrics,  # Use converted S objects
+                        all_grasp_visualization_data,
+                        window_name=f"ALL Generated Grasps - Class {class_id}",
+                        highlight_final=False,  # Show all grasps equally
+                        final_count=len(final_grasp_poses)
                     )
+                    
+                    # 2. Show ONLY final selected grasps
+                    final_grasp_visualization_data = []
+                    for i, pose in enumerate(final_grasp_poses):
+                        # Find the corresponding sq_info for this pose
+                        pose_key = tuple(pose.flatten())
+                        for viz_pose, sq_info in zip(visualization_grasps['poses'], visualization_grasps['info']):
+                            if tuple(viz_pose.flatten()) == pose_key:
+                                final_grasp_visualization_data.append({
+                                    'pose': pose,
+                                    'sq_index': sq_info['sq_index'],
+                                    'score': sq_info.get('grasp_score', 0.0),
+                                    'is_final': True,
+                                    'rank': i + 1  # Add ranking information
+                                })
+                                break
+                    
+                    self.get_logger().info(
+                        f"Visualizing FINAL {len(final_grasp_visualization_data)} selected grasps"
+                    )
+                    self.grasp_planner.visualize_multi_sq_grasps(
+                        points_for_ems,
+                        planner_superquadrics,
+                        final_grasp_visualization_data,
+                        window_name=f"FINAL Selected Grasps - Class {class_id}",
+                        highlight_final=True,  # Highlight the best (rank 1) grasp
+                        final_count=len(final_grasp_poses)
+                    )
+                    
                 except Exception as viz_error:
                     self.get_logger().error(f"Visualization error: {viz_error}")
             
@@ -1494,7 +1762,8 @@ class ZedGpuNode(Node):
             self.get_logger().error(traceback.format_exc())
             return []
         
-    def visualize_multi_superquadric_grasps(self, points_for_ems, all_valid_sqs, all_grasp_poses, all_sq_info):
+    def visualize_multi_superquadric_grasps(self, points_for_ems, all_valid_sqs, all_grasp_poses, all_sq_info, 
+                                           window_name="Multi-Superquadric Grasps", highlight_best=False):
         """Visualize all superquadrics and their corresponding grasps"""
         try:
             # Ensure points_for_ems is a proper numpy array with correct dtype
@@ -1542,79 +1811,596 @@ class ZedGpuNode(Node):
                     self.get_logger().warn(f"Failed to create mesh for SQ {i+1}: {mesh_error}")
             
             # Add grasp poses as coordinate frames (colored by their source superquadric)
-            for grasp_pose, sq_info in zip(all_grasp_poses, all_sq_info):
+            for idx, (grasp_pose, sq_info) in enumerate(zip(all_grasp_poses, all_sq_info)):
                 try:
                     sq_index = sq_info['sq_index']
                     color = colors[sq_index % len(colors)]
                     
-                    # Create coordinate frame for this grasp
-                    grasp_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.02)
+                    # Different visualization for best grasp vs others
+                    if highlight_best and idx == 0:
+                        # BEST GRASP: Larger coordinate frame and sphere
+                        grasp_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.04)
+                        sphere_radius = 0.008
+                        sphere_color = [1.0, 0.0, 0.0]  # Bright red for best
+                    else:
+                        # Regular grasps
+                        grasp_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.02)
+                        sphere_radius = 0.005
+                        sphere_color = color
                     
                     # Transform the frame to the grasp pose
                     grasp_frame.transform(grasp_pose)
                     
-                    # Color it based on the source superquadric
-                    # Note: coordinate frames have their own colors, but we can add a small sphere
-                    grasp_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.005)
-                    grasp_sphere.paint_uniform_color(color)
+                    # Add colored sphere to mark grasp position
+                    grasp_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=sphere_radius)
+                    grasp_sphere.paint_uniform_color(sphere_color)
                     grasp_sphere.translate(grasp_pose[:3, 3])
                     
                     geometries.extend([grasp_frame, grasp_sphere])
                     
+                    # Log grasp details
+                    pos = grasp_pose[:3, 3]
+                    grasp_score = sq_info.get('grasp_score', 0.0)
+                    
+                    if highlight_best and idx == 0:
+                        self.get_logger().info(f"★ BEST GRASP: SQ{sq_index+1}, score={grasp_score:.6f}, pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+                    elif idx < 5:  # Log first few
+                        self.get_logger().info(f"  Grasp {idx+1}: SQ{sq_index+1}, score={grasp_score:.6f}, pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+                    
                 except Exception as grasp_error:
-                    self.get_logger().warn(f"Failed to visualize grasp from SQ {sq_index+1}: {grasp_error}")
+                    self.get_logger().warn(f"Failed to visualize grasp {idx+1} from SQ {sq_index+1}: {grasp_error}")
             
             # Add main coordinate frame
             coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
             geometries.append(coord_frame)
             
+            # Create legend text (in window title)
+            grasp_type = "FINAL SELECTED" if highlight_best else "ALL GENERATED"
+            full_window_name = f"{window_name} ({len(all_valid_sqs)} SQs, {len(all_grasp_poses)} {grasp_type} grasps)"
+            
             # Visualize everything
             o3d.visualization.draw_geometries(
                 geometries,
-                window_name=f"Multi-Superquadric Grasps ({len(all_valid_sqs)} SQs, {len(all_grasp_poses)} grasps)",
+                window_name=full_window_name,
                 zoom=0.7,
                 front=[0, -1, 0],
                 lookat=np.mean(points_for_ems, axis=0),
                 up=[0, 0, 1]
             )
             
-            # Also create individual visualizations for each superquadric
+            # Print legend to console
+            print(f"\n{'='*60}")
+            print(f"{grasp_type} GRASPS VISUALIZATION LEGEND:")
+            print(f"{'='*60}")
             for i, sq in enumerate(all_valid_sqs):
-                # Find grasps from this superquadric
-                sq_grasps = [grasp for grasp, info in zip(all_grasp_poses, all_sq_info) 
-                            if info['sq_index'] == i]
-                
-                if sq_grasps:
-                    self.get_logger().info(f"Visualizing SQ {i+1} with {len(sq_grasps)} grasps")
-                    
-                    consistent_euler = R_simple.from_matrix(sq.RotM).as_euler('xyz')
-                    
-                    visualize_superquadric_grasps(
-                        point_cloud_data=points_for_ems,
-                        superquadric_params={
-                            'shape': sq.shape,
-                            'scale': sq.scale,
-                            'euler': consistent_euler,
-                            'translation': sq.translation
-                        },
-                        grasp_poses=sq_grasps,
-                        show_sweep_volume=False,
-                        window_name=f"SQ {i+1} Grasps ({len(sq_grasps)} grasps)",
-                    )
+                color = colors[i % len(colors)]
+                print(f"  SQ {i+1}: RGB{color} - Center={sq.translation}")
+            if highlight_best:
+                print(f"  ★ BEST GRASP: Large red sphere with large coordinate frame")
+                print(f"  Other grasps: Small colored spheres with small coordinate frames")
+            else:
+                print(f"  All grasps: Small colored spheres (colored by source SQ)")
+            print(f"{'='*60}")
                     
         except Exception as e:
             self.get_logger().error(f"Error in multi-superquadric visualization: {e}")
             
+            
+    def grasp_execution_callback(self, msg):
+        """Track grasp execution state"""
+        self.grasp_executing = msg.data
+        if msg.data:
+            self.get_logger().info("Grasp execution started - pausing pose generation")
+        else:
+            self.get_logger().info("Grasp execution finished - resuming pose generation")
+            
+            
+    def _start_live_capture(self):
+        """Start separate high-frequency capture thread for web display"""
+        try:
+            self.live_capture_enabled = True
+            self.live_capture_thread = threading.Thread(target=self._live_capture_worker, daemon=True)
+            self.live_capture_thread.start()
+            self.get_logger().info("Started live capture thread for web display at ~15 FPS")
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to start live capture: {e}")
+            self.live_capture_enabled = False
+
+    def _live_capture_worker(self):
+        """High-frequency capture worker for web display (runs at ~15 FPS)"""
+        frame_count = 0
+        
+        while self.live_capture_enabled and rclpy.ok():
+            try:
+                start_time = time.time()
+                
+                # Quick frame capture (non-blocking)
+                if (self.zed1.grab() == sl.ERROR_CODE.SUCCESS and 
+                    self.zed2.grab() == sl.ERROR_CODE.SUCCESS):
+                    
+                    # Retrieve frames quickly
+                    self.zed1.retrieve_image(self.image1, view=sl.VIEW.LEFT)
+                    self.zed2.retrieve_image(self.image2, view=sl.VIEW.LEFT)
+                    
+                    frame1 = cv2.cvtColor(self.image1.get_data(), cv2.COLOR_BGRA2BGR)
+                    frame2 = cv2.cvtColor(self.image2.get_data(), cv2.COLOR_BGRA2BGR)
+                    
+                    # Store original frame dimensions
+                    original_height, original_width = frame1.shape[:2]
+                    
+                    # Quick YOLO inference for live display (lower resolution for speed)
+                    yolo_width, yolo_height = 320, 180
+                    frame1_small = cv2.resize(frame1, (yolo_width, yolo_height))
+                    frame2_small = cv2.resize(frame2, (yolo_width, yolo_height))
+                    
+                    # Calculate proper scaling factors
+                    width_scale = original_width / yolo_width    # e.g., 1920 / 320 = 6.0
+                    height_scale = original_height / yolo_height # e.g., 1080 / 180 = 6.0
+                    
+                    # Fast YOLO inference
+                    results_batch = self.model.predict(
+                        source=[frame1_small, frame2_small],
+                        classes=[0, 1, 2, 3, 4],
+                        conf=self.conf_threshold,
+                        device=self.device,
+                        verbose=False,  # Reduce output
+                        imgsz=320       # Smaller image size for speed
+                    )
+                    
+                    results1_live, results2_live = results_batch[0], results_batch[1]
+                    
+                    # Create live display frame with proper scaling
+                    live_display = self._create_live_web_display(
+                        frame1, frame2, results1_live, results2_live, frame_count, 
+                        width_scale=width_scale, height_scale=height_scale
+                    )
+                    
+                    # Thread-safe update of web frame AND save to disk immediately
+                    with self.web_frame_lock:
+                        self.latest_web_frame = live_display
+                        
+                        # Save frame to disk for web server (every frame for true live display)
+                        web_image_path = f"{self.web_dir}/latest.jpg"
+                        cv2.imwrite(web_image_path, live_display, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    
+                    # Less frequent logging
+                    if frame_count % 60 == 0:  # Every 4 seconds
+                        self.get_logger().info(f"Live frame {frame_count} updated (15 FPS)")
+                    
+                    frame_count += 1
+                
+                # Target ~15 FPS for live capture
+                elapsed = time.time() - start_time
+                sleep_time = max(0, 1.0/15.0 - elapsed)
+                time.sleep(sleep_time)
+                
+            except Exception as e:
+                if frame_count < 5:  # Only log first few errors
+                    self.get_logger().warn(f"Live capture error (frame {frame_count}): {e}")
+                time.sleep(0.1)  # Brief pause on error
+                
+        self.get_logger().info("Live capture worker stopped")
+
+    def _draw_yolo_detections_web(self, frame, results, camera_name, width_scale=1.0, height_scale=1.0):
+        """Draw YOLO detection boxes and labels on frame for web display with proper scaling"""
+        try:
+            if results is None:
+                return
+                
+            if results.boxes is not None and len(results.boxes) > 0:
+                # Get boxes as numpy array and scale them properly
+                boxes = results.boxes.xyxy.cpu().numpy()
+                confidences = results.boxes.conf.cpu().numpy()
+                class_ids = results.boxes.cls.cpu().numpy().astype(int)
+                
+                # Apply proper scaling (different for width and height if needed)
+                boxes[:, [0, 2]] *= width_scale   # Scale x coordinates (x1, x2)
+                boxes[:, [1, 3]] *= height_scale  # Scale y coordinates (y1, y2)
+                
+                for i, (box, confidence, class_id) in enumerate(zip(boxes, confidences, class_ids)):
+                    x1, y1, x2, y2 = [int(v) for v in box]
+                    
+                    # Ensure coordinates are within frame bounds
+                    frame_height, frame_width = frame.shape[:2]
+                    x1 = max(0, min(x1, frame_width - 1))
+                    y1 = max(0, min(y1, frame_height - 1))
+                    x2 = max(0, min(x2, frame_width - 1))
+                    y2 = max(0, min(y2, frame_height - 1))
+                    
+                    class_name = self.class_names.get(class_id, f'Class_{class_id}')
+                    
+                    # Color based on class with better visibility
+                    colors = [
+                        (0, 255, 0),    # Green - Cone
+                        (255, 0, 0),    # Blue - Cup  
+                        (0, 0, 255),    # Red - Mallet
+                        (255, 255, 0),  # Cyan - Screw Driver
+                        (255, 0, 255)   # Magenta - Sunscreen
+                    ]
+                    color = colors[class_id % len(colors)]
+                    
+                    # Draw thicker bounding box for web visibility
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+                    
+                    # Draw label with better background
+                    label = f"{class_name}: {confidence:.2f}"
+                    label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                    
+                    # Ensure label doesn't go outside frame
+                    label_y = max(y1, label_size[1] + 15)
+                    label_x1 = max(0, x1)
+                    label_x2 = min(frame_width, x1 + label_size[0] + 10)
+                    
+                    # Draw background rectangle for label
+                    cv2.rectangle(frame, (label_x1, label_y - label_size[1] - 15), 
+                                (label_x2, label_y), color, -1)
+                    
+                    # Draw label text in black for better contrast
+                    cv2.putText(frame, label, (label_x1 + 5, label_y - 5), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                    
+        except Exception as e:
+            self.get_logger().error(f"Error drawing YOLO detections for web: {e}")
+
+    def _create_live_web_display(self, frame1, frame2, results1, results2, frame_count, width_scale=1.0, height_scale=1.0):
+        """Create live display frame for web interface with proper scaling"""
+        try:
+            display1 = frame1.copy()
+            display2 = frame2.copy()
+            
+            # Draw YOLO detections with proper scaling
+            self._draw_yolo_detections_web(display1, results1, "Camera 1", width_scale, height_scale)
+            self._draw_yolo_detections_web(display2, results2, "Camera 2", width_scale, height_scale)
+            
+            # Add live feed info
+            current_time = time.time()
+            timestamp_str = time.strftime("%H:%M:%S", time.localtime(current_time))
+            
+            # Frame 1 overlay
+            cv2.putText(display1, f"LIVE Camera 1 - {timestamp_str}", (20, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(display1, f"Live FPS: ~15", (20, 60), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(display1, f"Frame: {frame_count}", (20, 90), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(display1, f"Scale: {width_scale:.1f}x{height_scale:.1f}", (20, 120), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            
+            # Frame 2 overlay  
+            cv2.putText(display2, f"LIVE Camera 2 - {timestamp_str}", (20, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            
+            # Add detection counts
+            det_count1 = len(results1.boxes) if results1 and results1.boxes is not None else 0
+            det_count2 = len(results2.boxes) if results2 and results2.boxes is not None else 0
+            
+            cv2.putText(display1, f"Live Detections: {det_count1}", (20, 150), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+            cv2.putText(display2, f"Live Detections: {det_count2}", (20, 60), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+            
+            # Add processing status if available
+            if hasattr(self, 'fps_values') and self.fps_values:
+                processing_fps = sum(self.fps_values) / len(self.fps_values)
+                cv2.putText(display2, f"Processing: {processing_fps:.1f} FPS", (20, 90), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            # Resize for web (balance between quality and speed)
+            display1_resized = cv2.resize(display1, (640, 360))
+            display2_resized = cv2.resize(display2, (640, 360))
+            
+            # Combine
+            combined_display = cv2.hconcat([display1_resized, display2_resized])
+            
+            # Add title bar
+            border_height = 40
+            total_height = combined_display.shape[0] + border_height
+            total_width = combined_display.shape[1]
+            
+            final_display = np.zeros((total_height, total_width, 3), dtype=np.uint8)
+            final_display[border_height:, :] = combined_display
+            
+            # Live indicator
+            cv2.rectangle(final_display, (0, 0), (total_width, border_height), (0, 100, 0), -1)  # Green bar
+            cv2.putText(final_display, f"LIVE - ZED Stereo YOLO Detection (Frame {frame_count})", (20, 25), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            
+            return final_display
+            
+        except Exception as e:
+            self.get_logger().error(f"Error creating live display: {e}")
+            # Return error frame
+            error_frame = np.zeros((400, 1280, 3), dtype=np.uint8)
+            cv2.putText(error_frame, "Live Display Error", (400, 200), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 255), 3)
+            return error_frame
+
+    def _setup_web_server(self):
+        """Setup web server with updated HTML for live display"""
+        try:
+            self.web_dir = "/tmp/yolo_live"
+            os.makedirs(self.web_dir, exist_ok=True)
+            
+            # Create a placeholder image first
+            placeholder_frame = np.zeros((400, 1280, 3), dtype=np.uint8)
+            cv2.putText(placeholder_frame, "Initializing cameras and YOLO...", (400, 200), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 2)
+            cv2.imwrite(f"{self.web_dir}/latest.jpg", placeholder_frame)
+            
+            html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>LIVE YOLO Detection - ZED Cameras</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background-color: #f0f0f0;
+            }
+            .container {
+                max-width: 1400px;
+                margin: 0 auto;
+                background-color: white;
+                padding: 20px;
+                border-radius: 10px;
+                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            }
+            h1 {
+                color: #333;
+                text-align: center;
+                margin-bottom: 10px;
+            }
+            .live-indicator {
+                text-align: center;
+                background-color: #28a745;
+                color: white;
+                padding: 10px;
+                border-radius: 5px;
+                margin-bottom: 20px;
+                font-weight: bold;
+                animation: pulse 2s infinite;
+            }
+            @keyframes pulse {
+                0% { opacity: 1; }
+                50% { opacity: 0.7; }
+                100% { opacity: 1; }
+            }
+            .image-container {
+                text-align: center;
+                margin-bottom: 20px;
+            }
+            #live_image {
+                max-width: 100%;
+                height: auto;
+                border: 2px solid #28a745;
+                border-radius: 5px;
+            }
+            .controls {
+                text-align: center;
+                margin: 20px 0;
+            }
+            button {
+                background-color: #28a745;
+                color: white;
+                padding: 10px 20px;
+                border: none;
+                border-radius: 5px;
+                cursor: pointer;
+                margin: 0 10px;
+                font-size: 16px;
+            }
+            button:hover {
+                background-color: #218838;
+            }
+            .status {
+                text-align: center;
+                padding: 10px;
+                border-radius: 5px;
+                margin: 10px 0;
+            }
+            .status.connected {
+                background-color: #d4edda;
+                color: #155724;
+                border: 1px solid #c3e6cb;
+            }
+            .status.disconnected {
+                background-color: #f8d7da;
+                color: #721c24;
+                border: 1px solid #f5c6cb;
+            }
+            .fps-display {
+                font-weight: bold;
+                color: #28a745;
+                text-align: center;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>[LIVE] YOLO Detection - ZED Stereo Cameras</h1>
+            
+            <div class="live-indicator">
+                [LIVE FEED] - Real-time at ~15 FPS
+            </div>
+            
+            <div id="status" class="status connected">
+                Live feed active - Independent of processing loop
+            </div>
+            
+            <div class="controls">
+                <button onclick="toggleRefresh()">Pause/Resume</button>
+                <button onclick="saveImage()">Save Frame</button>
+                <button onclick="toggleFullscreen()">Fullscreen</button>
+                <button onclick="resetConnection()">Reset</button>
+            </div>
+            
+            <div class="image-container">
+                <img id="live_image" src="latest.jpg" alt="Loading live feed..." />
+            </div>
+            
+            <div class="fps-display">
+                Display FPS: <span id="fps">--</span> | 
+                Last updated: <span id="timestamp">--</span> |
+                Total frames: <span id="frame_count">0</span>
+            </div>
+        </div>
+
+        <script>
+            let refreshInterval;
+            let isRefreshing = true;
+            let frameCount = 0;
+            let lastFrameTime = Date.now();
+            
+            function updateImage() {
+                if (!isRefreshing) return;
+                
+                const img = document.getElementById('live_image');
+                const timestamp = Date.now();
+                
+                // Calculate display FPS
+                const timeDiff = timestamp - lastFrameTime;
+                const displayFPS = timeDiff > 0 ? (1000 / timeDiff).toFixed(1) : 0;
+                
+                // Add timestamp to prevent caching
+                img.src = 'latest.jpg?' + timestamp;
+                
+                // Update displays
+                document.getElementById('timestamp').textContent = new Date().toLocaleTimeString();
+                document.getElementById('fps').textContent = displayFPS;
+                document.getElementById('frame_count').textContent = frameCount++;
+                
+                lastFrameTime = timestamp;
+            }
+            
+            function toggleRefresh() {
+                isRefreshing = !isRefreshing;
+                const button = event.target;
+                const status = document.getElementById('status');
+                
+                if (isRefreshing) {
+                    button.textContent = 'Pause';
+                    status.textContent = 'Live feed active - Independent of processing loop';
+                    status.className = 'status connected';
+                } else {
+                    button.textContent = 'Resume';
+                    status.textContent = 'Paused - Click resume to continue';
+                    status.className = 'status disconnected';
+                }
+            }
+            
+            function saveImage() {
+                const link = document.createElement('a');
+                link.href = 'latest.jpg?' + Date.now();
+                link.download = 'live_yolo_detection_' + Date.now() + '.jpg';
+                link.click();
+            }
+            
+            function toggleFullscreen() {
+                const img = document.getElementById('live_image');
+                if (img.requestFullscreen) {
+                    img.requestFullscreen();
+                }
+            }
+            
+            function resetConnection() {
+                frameCount = 0;
+                document.getElementById('frame_count').textContent = '0';
+                updateImage();
+            }
+            
+            // Handle image load events
+            document.getElementById('live_image').onerror = function() {
+                const status = document.getElementById('status');
+                status.textContent = 'Connection lost - Check if cameras are running';
+                status.className = 'status disconnected';
+            };
+            
+            document.getElementById('live_image').onload = function() {
+                const status = document.getElementById('status');
+                if (isRefreshing) {
+                    status.textContent = 'Live feed active - Independent of processing loop';
+                    status.className = 'status connected';
+                }
+            };
+            
+            // High refresh rate for truly live display (66ms = ~15 FPS to match capture)
+            refreshInterval = setInterval(updateImage, 66);
+            
+            // Initial load
+            updateImage();
+        </script>
+    </body>
+    </html>
+            """
+            
+            with open(f"{self.web_dir}/index.html", "w", encoding='utf-8') as f:
+                f.write(html_content)
+            
+            self.web_server_thread = threading.Thread(target=self._run_web_server, daemon=True)
+            self.web_server_thread.start()
+            
+            self.get_logger().info("LIVE web interface available at: http://localhost:8080")
+            self.get_logger().info("   This will show true live feed at ~15 FPS independent of ROS processing")
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to setup web server: {e}")
+            self.web_enabled = False
+
+    def _run_web_server(self):
+        """Run simple web server with better error handling"""
+        try:
+            class Handler(SimpleHTTPRequestHandler):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, directory="/tmp/yolo_live", **kwargs)
+                
+                def log_message(self, format, *args):
+                    # Suppress server logs to keep ROS logs clean
+                    pass
+                    
+                def do_GET(self):
+                    """Handle GET requests with better error handling"""
+                    try:
+                        super().do_GET()
+                    except (BrokenPipeError, ConnectionResetError):
+                        # Browser closed connection - this is normal, don't log as error
+                        pass
+                    except Exception as e:
+                        # Only log unexpected errors
+                        print(f"Web server request error: {e}")
+            
+            httpd = HTTPServer(("localhost", 8080), Handler)
+            self.get_logger().info("Web server started on port 8080")
+            httpd.serve_forever()
+            
+        except Exception as e:
+            self.get_logger().error(f"Web server error: {e}")
+
+
+            
     def destroy_node(self):
-        """Clean up resources when the node is destroyed"""
+        """Clean up resources"""
         self.get_logger().info("Shutting down ZED cameras...")
+        
+        # Stop live capture
+        if self.live_capture_enabled:
+            self.live_capture_enabled = False
+            if self.live_capture_thread and self.live_capture_thread.is_alive():
+                self.live_capture_thread.join(timeout=2.0)
+        
+        # Stop web server
+        if self.web_enabled:
+            self.get_logger().info("Stopping web server...")
+        
+        # Clean up cameras
         if hasattr(self, 'zed1'):
             self.zed1.close()
         if hasattr(self, 'zed2'):
             self.zed2.close()
-        cv2.destroyAllWindows()
+            
         super().destroy_node()
-
 
 def main(args=None):
     rclpy.init(args=args)
@@ -1635,8 +2421,6 @@ def main(args=None):
                     break
         finally:
             executor.shutdown()
-            # node.destroy_node() is called below, no need for cv2.destroyAllWindows() here
-            # as destroy_node() handles it.
     
     except Exception as e:
         if node:

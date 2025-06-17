@@ -1,13 +1,3 @@
-import sys
-import os
-
-# Fix Qt plugin path issues before importing any GUI libraries
-os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = ''
-# os.environ['QT_QPA_PLATFORM'] = 'offscreen'  # Use headless mode
-os.environ['DISPLAY'] = ':0'  # Ensure DISPLAY is set
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 #!/usr/bin/env python3
 
 import numpy as np
@@ -25,18 +15,12 @@ from std_msgs.msg import Header
 from rclpy.executors import MultiThreadedExecutor
 import sensor_msgs_py.point_cloud2 as pc2
 from ultralytics import YOLO
-from zed_pose_estimation.grasp_pose_utils import *
 from zed_pose_estimation.vision_pipeline_utils import crop_point_cloud_gpu, fuse_point_clouds_centroid, subtract_point_clouds_gpu, convert_mask_to_3d_points, downsample_point_cloud_gpu
 import open3d as o3d
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from tf2_ros import TransformBroadcaster
 from scipy.spatial.transform import Rotation
 import traceback
-import sys
-
-# Add superquadric fitting imports
-from EMS.EMS_recovery import EMS_recovery
-from zed_pose_estimation.superquadric_grasp_planner import SuperquadricGraspPlanner
 
 class ZedGpuNode(Node):
     def __init__(self):
@@ -57,17 +41,11 @@ class ZedGpuNode(Node):
             os.path.dirname(os.path.abspath(__file__)), '..', 'config', 'transform.yaml')) # Default path
         
         # New ICP parameters
-        self.declare_parameter('icp_enabled', False)
-        self.declare_parameter('model_path', '/home/chris/franka_ros2_ws/src/zed_pose_estimation/models/objects/cone with planar surface.ply')
+        self.declare_parameter('icp_enabled', True)
+        self.declare_parameter('model_path', '/home/chris/franka_ros2_ws/src/zed_pose_estimation/pointclouds/cone with planar surface_orange.ply')
         self.declare_parameter('publish_tf', True)
         self.declare_parameter('icp_distance_threshold', 0.03)
-        self.declare_parameter('visualize_icp', True)  # Separate from other visualization
-        
-        # New superquadric parameters
-        self.declare_parameter('superquadric_enabled', True)
-        self.declare_parameter('gripper_jaw_length', 0.054)  # meters
-        self.declare_parameter('gripper_max_opening', 0.08)   # meters
-        self.declare_parameter('outlier_ratio', 0.2)         # EMS parameter
+        self.declare_parameter('visualize_icp', False)  # Separate from other visualization
         
         # Get original parameters
         self.camera1_sn = self.get_parameter('camera1_sn').get_parameter_value().integer_value
@@ -90,31 +68,11 @@ class ZedGpuNode(Node):
         self.icp_distance_threshold = self.get_parameter('icp_distance_threshold').get_parameter_value().double_value
         self.visualize_icp = self.get_parameter('visualize_icp').get_parameter_value().bool_value
         
-        # Get superquadric parameters
-        self.superquadric_enabled = self.get_parameter('superquadric_enabled').get_parameter_value().bool_value
-        self.gripper_jaw_length = self.get_parameter('gripper_jaw_length').get_parameter_value().double_value
-        self.gripper_max_opening = self.get_parameter('gripper_max_opening').get_parameter_value().double_value
-        self.outlier_ratio = self.get_parameter('outlier_ratio').get_parameter_value().double_value
-        
-        # Initialize superquadric grasp planner if enabled
-        if self.superquadric_enabled:
-            try:
-                self.grasp_planner = SuperquadricGraspPlanner(
-                    jaw_len=self.gripper_jaw_length,
-                    max_open=self.gripper_max_opening
-                )
-                self.get_logger().info("Superquadric grasp planner initialized")
-            except Exception as e:
-                self.get_logger().error(f"Failed to initialize superquadric grasp planner: {e}")
-                self.superquadric_enabled = False
-        else:
-            self.grasp_planner = None
-        
         self.future_shutdown = False
 
-        self.class_names = {0: "Box", 1: "Cone", 2: "Cover", 3: "Plier",
-                           4: "Robot", 5: "Screw Driver"}
-
+        self.class_names = {0: "Box", 1: "Cone", 2: "Cover", 3: "Plier", 
+                           4: "Robot", 5: "Scre Driver"}
+        
         # Dictionary to store timings for benchmarking
         self.timings = {
             "Frame Retrieval": [],
@@ -144,10 +102,10 @@ class ZedGpuNode(Node):
         if self.icp_enabled:
             self.load_reference_model()
             
-        # Setup TF broadcaster and pose publisher (needed for both ICP and superquadric grasps)
-        self.pose_publisher = self.create_publisher(PoseStamped, '/perception/object_pose', 10)
-        if self.publish_tf:
-            self.tf_broadcaster = TransformBroadcaster(self)
+            # Setup TF broadcaster and pose publisher for ICP
+            self.pose_publisher = self.create_publisher(PoseStamped, '/perception/object_pose', 10)
+            if self.publish_tf:
+                self.tf_broadcaster = TransformBroadcaster(self)
         
         # Initialize ZED cameras
         self.get_logger().info("Initializing ZED cameras...")
@@ -305,23 +263,6 @@ class ZedGpuNode(Node):
         self.get_logger().info(f"Calculated T_robot_cam1 (Cam1 to Robot):\n{T_robot_cam1}")
         self.get_logger().info(f"Calculated T_robot_cam2 (Cam2 to Robot):\n{T_robot_cam2}")
 
-    def update_camera_intrinsics(self):
-        """Update camera intrinsics"""
-        try:
-            # Get fresh calibration parameters
-            calib_params1 = self.zed1.get_camera_information().camera_configuration.calibration_parameters
-            self.fx1, self.fy1 = calib_params1.left_cam.fx, calib_params1.left_cam.fy
-            self.cx1, self.cy1 = calib_params1.left_cam.cx, calib_params1.left_cam.cy
-            
-            calib_params2 = self.zed2.get_camera_information().camera_configuration.calibration_parameters
-            self.fx2, self.fy2 = calib_params2.left_cam.fx, calib_params2.left_cam.fy
-            self.cx2, self.cy2 = calib_params2.left_cam.cx, calib_params2.left_cam.cy
-            
-            self.get_logger().info("Camera intrinsics updated")
-            
-        except Exception as e:
-            self.get_logger().error(f"Failed to update intrinsics: {e}")
-    
     def process_frames(self):
         """Main processing loop - timer callback"""
         try:
@@ -332,15 +273,6 @@ class ZedGpuNode(Node):
                 self.zed2.grab() != sl.ERROR_CODE.SUCCESS):
                 self.get_logger().warn("Failed to grab frames from cameras")
                 return
-            
-            # Update intrinsics every 100 frames
-            if hasattr(self, 'frame_count'):
-                self.frame_count += 1
-            else:
-                self.frame_count = 0
-                
-            if self.frame_count % 100 == 0:
-                self.update_camera_intrinsics()
                 
             # Step 1: Frame retrieval
             retrieval_start = time.time()
@@ -367,16 +299,47 @@ class ZedGpuNode(Node):
             depth_time = time.time() - depth_start
             self.timings["Depth Retrieval"].append(depth_time)
             
-            # Step 3: Point cloud processing
+            # Step 3: Point cloud processing (with color)
             pc_start = time.time()
-            self.zed1.retrieve_measure(self.point_cloud1_ws, measure=sl.MEASURE.XYZ)
-            self.zed2.retrieve_measure(self.point_cloud2_ws, measure=sl.MEASURE.XYZ)
+            # Retrieve point clouds with color information
+            self.zed1.retrieve_measure(self.point_cloud1_ws, measure=sl.MEASURE.XYZRGBA)
+            self.zed2.retrieve_measure(self.point_cloud2_ws, measure=sl.MEASURE.XYZRGBA)
             
-            # Convert to tensors
-            pc1_tensor = torch.tensor(self.point_cloud1_ws.get_data()[:, :, :3], 
-                                     dtype=torch.float32, device=self.device).reshape(-1, 3)
-            pc2_tensor = torch.tensor(self.point_cloud2_ws.get_data()[:, :, :3], 
-                                     dtype=torch.float32, device=self.device).reshape(-1, 3)
+            # Get point cloud data with color
+            pc1_data = self.point_cloud1_ws.get_data()
+            pc2_data = self.point_cloud2_ws.get_data()
+            
+            # Extract XYZ coordinates
+            pc1_xyz = pc1_data[:, :, :3]  # View, not copy
+            pc1_tensor = torch.from_numpy(pc1_xyz).float().to(self.device).reshape(-1, 3)
+            pc2_xyz = pc2_data[:, :, :3]  # View, not copy
+            pc2_tensor = torch.from_numpy(pc2_xyz).float().to(self.device).reshape(-1, 3)
+
+            # Extract RGBA color information (if needed)
+            pc1_colors = pc1_data[:, :, 3].reshape(-1)  # RGBA packed as uint32
+            pc2_colors = pc2_data[:, :, 3].reshape(-1)
+            
+            # Debug: Check data types
+            self.get_logger().info(f"pc1_colors dtype: {pc1_colors.dtype}, shape: {pc1_colors.shape}")
+            self.get_logger().info(f"pc2_colors dtype: {pc2_colors.dtype}, shape: {pc2_colors.shape}")
+            
+            # Convert packed RGBA to separate RGB channels (if you need RGB values)
+            def unpack_rgba(packed_colors):
+                try:
+                    if packed_colors.dtype != np.uint32:
+                        packed_colors = packed_colors.view(np.uint32)
+                    # Unpack RGBA from uint32
+                    r = (packed_colors & 0xFF).astype(np.uint8)
+                    g = ((packed_colors >> 8) & 0xFF).astype(np.uint8)
+                    b = ((packed_colors >> 16) & 0xFF).astype(np.uint8)
+                    a = ((packed_colors >> 24) & 0xFF).astype(np.uint8)
+                    return np.column_stack([r, g, b, a])
+                except ValueError as e:
+                    self.get_logger().error(f"RGBA unpacking failed: {e}")
+                    return np.zeros((len(packed_colors), 4), dtype=np.uint8)
+            
+            pc1_rgba = unpack_rgba(pc1_colors)
+            pc2_rgba = unpack_rgba(pc2_colors)
             
             # Filter invalid points
             valid_mask1 = torch.isfinite(pc1_tensor).all(dim=1)
@@ -384,69 +347,172 @@ class ZedGpuNode(Node):
             pc1_tensor = pc1_tensor[valid_mask1]
             pc2_tensor = pc2_tensor[valid_mask2]
             
-            # # Visualize raw point clouds before transformation
-            # pc1_np = pc1_tensor.cpu().numpy()
-            # pc2_np = pc2_tensor.cpu().numpy()
+            # Also filter colors to match valid points
+            pc1_rgba_valid_np = pc1_rgba[valid_mask1.cpu().numpy()]
+            pc2_rgba_valid_np = pc2_rgba[valid_mask2.cpu().numpy()]
 
-            # # Create Open3D point clouds for raw data
-            # raw_cloud1 = o3d.geometry.PointCloud()
-            # raw_cloud1.points = o3d.utility.Vector3dVector(pc1_np)
-            # raw_cloud1.paint_uniform_color([1, 0, 0])  # Red for camera 1
+            # Create Open3D point clouds for raw data
+            raw_cloud1 = o3d.geometry.PointCloud()
+            raw_cloud1.points = o3d.utility.Vector3dVector(pc1_tensor.cpu().numpy())  # Use the actual 3D points
+            raw_cloud1.colors = o3d.utility.Vector3dVector(pc1_rgba_valid_np[:, :3] / 255.0)  # Use RGB columns (0:3)
+            
+            raw_cloud2 = o3d.geometry.PointCloud()
+            raw_cloud2.points = o3d.utility.Vector3dVector(pc2_tensor.cpu().numpy())  # Use the actual 3D points
+            raw_cloud2.colors = o3d.utility.Vector3dVector(pc2_rgba_valid_np[:, :3] / 255.0)  # Use RGB columns (0:3)
 
-            # raw_cloud2 = o3d.geometry.PointCloud()
-            # raw_cloud2.points = o3d.utility.Vector3dVector(pc2_np)
-            # raw_cloud2.paint_uniform_color([0, 1, 0])  # Green for camera 2
 
-            # # Create coordinate frame
-            # coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+            # Create coordinate frame for reference
+            coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
 
-            # # Visualize raw point clouds (in their respective camera coordinates)
-            # o3d.visualization.draw_geometries(
-            #     [raw_cloud2, coord_frame],
-            #     zoom=0.35,
-            #     front=[0, 0, -1],
-            #     lookat=[0, 0, 0],
-            #     up=[0, -1, 0],
-            #     window_name="Raw Point Clouds (Camera Coordinates)"
-            # )
+            # Option 1: Visualize each camera separately
+            # Camera 1
+            o3d.visualization.draw_geometries(
+                [raw_cloud1, coord_frame],
+                zoom=0.35,
+                front=[0, 0, -1],
+                lookat=[0, 0, 0],
+                up=[0, -1, 0],
+                window_name="Camera 1 - Raw Point Cloud with Colors"
+            )
+            
+            # Camera 2
+            o3d.visualization.draw_geometries(
+                [raw_cloud2, coord_frame],
+                zoom=0.35,
+                front=[0, 0, -1],
+                lookat=[0, 0, 0],
+                up=[0, -1, 0],
+                window_name="Camera 2 - Raw Point Cloud with Colors"
+            )
             
             # Transform point clouds to robot frame
             pc1_transformed = torch.mm(pc1_tensor, self.rotation1_torch.T) + self.origin1_torch
             pc2_transformed = torch.mm(pc2_tensor, self.rotation2_torch.T) + self.origin2_torch
             
-            # Crop to workspace
+            # Crop to workspace - you'll need to modify your crop function to return indices
             x_bounds = (self.workspace_bounds[0], self.workspace_bounds[1])
             y_bounds = (self.workspace_bounds[2], self.workspace_bounds[3])
             z_bounds = (self.workspace_bounds[4], self.workspace_bounds[5])
             
-            pc1_cropped = crop_point_cloud_gpu(pc1_transformed, x_bounds, y_bounds, z_bounds)
-            pc2_cropped = crop_point_cloud_gpu(pc2_transformed, x_bounds, y_bounds, z_bounds)
+            # Get cropping masks to track which points remain
+            crop_mask1 = (
+                (pc1_transformed[:, 0] >= x_bounds[0]) & (pc1_transformed[:, 0] <= x_bounds[1]) &
+                (pc1_transformed[:, 1] >= y_bounds[0]) & (pc1_transformed[:, 1] <= y_bounds[1]) &
+                (pc1_transformed[:, 2] >= z_bounds[0]) & (pc1_transformed[:, 2] <= z_bounds[1])
+            )
+            crop_mask2 = (
+                (pc2_transformed[:, 0] >= x_bounds[0]) & (pc2_transformed[:, 0] <= x_bounds[1]) &
+                (pc2_transformed[:, 1] >= y_bounds[0]) & (pc2_transformed[:, 1] <= y_bounds[1]) &
+                (pc2_transformed[:, 2] >= z_bounds[0]) & (pc2_transformed[:, 2] <= z_bounds[1])
+            )
             
-            # Downsample
-            pc1_downsampled = downsample_point_cloud_gpu(pc1_cropped, self.voxel_size)
-            pc2_downsampled = downsample_point_cloud_gpu(pc2_cropped, self.voxel_size)
+            # Apply cropping to both points and colors
+            pc1_cropped = pc1_transformed[crop_mask1]
+            pc2_cropped = pc2_transformed[crop_mask2]
+            pc1_colors_cropped = pc1_rgba_valid_np[crop_mask1.cpu().numpy()]
+            pc2_colors_cropped = pc2_rgba_valid_np[crop_mask2.cpu().numpy()]
             
-            # Fuse workspace point clouds
+            # For downsampling with color preservation, you'll need a custom function
+            # or use Open3D which handles colors automatically
+            def downsample_with_colors(points_tensor, colors_np, voxel_size):
+                # Convert to Open3D point cloud
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(points_tensor.cpu().numpy())
+                pcd.colors = o3d.utility.Vector3dVector(colors_np[:, :3] / 255.0)  # Normalize RGB
+                
+                # Downsample
+                pcd_down = pcd.voxel_down_sample(voxel_size)
+                
+                return pcd_down
+            
+            # Downsample with colors
+            pc1_downsampled_colored = downsample_with_colors(pc1_cropped, pc1_colors_cropped, self.voxel_size)
+            pc2_downsampled_colored = downsample_with_colors(pc2_cropped, pc2_colors_cropped, self.voxel_size)
+            
+            # Create colored workspace point clouds
+            pc1_workspace_colored = o3d.geometry.PointCloud()
+            pc1_workspace_colored.points = o3d.utility.Vector3dVector(pc1_cropped.cpu().numpy())
+            pc1_workspace_colored.colors = o3d.utility.Vector3dVector(pc1_colors_cropped[:, :3] / 255.0)
+            
+            pc2_workspace_colored = o3d.geometry.PointCloud()
+            pc2_workspace_colored.points = o3d.utility.Vector3dVector(pc2_cropped.cpu().numpy())
+            pc2_workspace_colored.colors = o3d.utility.Vector3dVector(pc2_colors_cropped[:, :3] / 255.0)
+            
+            # Fuse colored workspace point clouds
+            fused_workspace_colored = pc1_workspace_colored + pc2_workspace_colored
+            
+            # Optional: Remove duplicate points while preserving colors
+            fused_workspace_colored = fused_workspace_colored.voxel_down_sample(self.voxel_size * 0.5)
+            
+            # Preprocess if needed (this might affect colors)
+            fused_workspace_colored_processed = self.preprocess_point_cloud(fused_workspace_colored)
+            
+            # Visualize the colored workspace point cloud
+            coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+            
+            # Option 1: Show raw fused colored workspace
+            o3d.visualization.draw_geometries(
+                [fused_workspace_colored, coordinate_frame],
+                window_name="Fused Workspace - Colored (Raw)",
+                zoom=0.7,
+                front=[0, -1, 0],
+                lookat=[0, 0, 0],
+                up=[0, 0, 1]
+            )
+            
+            # Option 2: Show processed colored workspace
+            o3d.visualization.draw_geometries(
+                [fused_workspace_colored_processed, coordinate_frame],
+                window_name="Fused Workspace - Colored (Processed)",
+                zoom=0.7,
+                front=[0, -1, 0],
+                lookat=[0, 0, 0],
+                up=[0, 0, 1]
+            )
+            
+            # Option 3: Show both cameras with different tints for identification
+            pc1_tinted = o3d.geometry.PointCloud(pc1_workspace_colored)
+            pc2_tinted = o3d.geometry.PointCloud(pc2_workspace_colored)
+            
+            # Add red tint to camera 1, blue tint to camera 2
+            colors1 = np.asarray(pc1_tinted.colors)
+            colors2 = np.asarray(pc2_tinted.colors)
+            colors1[:, 0] = np.minimum(colors1[:, 0] + 0.2, 1.0)  # Add red
+            colors2[:, 2] = np.minimum(colors2[:, 2] + 0.2, 1.0)  # Add blue
+            pc1_tinted.colors = o3d.utility.Vector3dVector(colors1)
+            pc2_tinted.colors = o3d.utility.Vector3dVector(colors2)
+            
+            o3d.visualization.draw_geometries(
+                [pc1_tinted, pc2_tinted, coordinate_frame],
+                window_name="Workspace - Camera 1 (Red) + Camera 2 (Blue)",
+                zoom=0.7,
+                front=[0, -1, 0],
+                lookat=[0, 0, 0],
+                up=[0, 0, 1]
+            )
+            
+            # Save colored point clouds for external visualization
+            # o3d.io.write_point_cloud("pointclouds/workspace_cam1_colored.ply", pc1_workspace_colored)
+            # o3d.io.write_point_cloud("pointclouds/workspace_cam2_colored.ply", pc2_workspace_colored)
+            # o3d.io.write_point_cloud("pointclouds/workspace_fused_colored.ply", fused_workspace_colored)
+            # o3d.io.write_point_cloud("pointclouds/workspace_fused_colored_processed.ply", fused_workspace_colored_processed)
+            # #fuse tinted point clouds
+            # fused_tinted_workspace = pc1_tinted + pc2_tinted
+            # o3d.io.write_point_cloud("pointclouds/workspace_fused_tinted.ply", fused_tinted_workspace)
+            
+            
+            # For the rest of your pipeline, you might want to keep the non-colored version
+            # for compatibility with existing functions
             fused_workspace = torch.cat((pc1_cropped, pc2_cropped), dim=0)
             fused_workspace_np = fused_workspace.cpu().numpy()
             pcd_fused_workspace = o3d.geometry.PointCloud()
             pcd_fused_workspace.points = o3d.utility.Vector3dVector(fused_workspace_np)
             pcd_fused_workspace = self.preprocess_point_cloud(pcd_fused_workspace)
             
-            ############################
-            # save the fused workspace point cloud to a file
-            fused_workspace_xyz = o3d.geometry.PointCloud()
-            fused_workspace_xyz.points = pcd_fused_workspace.points
-            
-            
-            o3d.io.write_point_cloud("pointclouds/fused_workspace_xyz.ply", fused_workspace_xyz)
-
             #visualize the workspace point cloud
             # Visualize the workspace point cloud
             coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
             o3d.visualization.draw_geometries([pcd_fused_workspace, coordinate_frame])
-            ############################
-            
             
             pc_time = time.time() - pc_start
             self.timings["Point Cloud Processing"].append(pc_time)
@@ -573,22 +639,6 @@ class ZedGpuNode(Node):
                     if len(object_points) < 50:
                         self.get_logger().warn(f"Object {i} has too few points ({len(object_points)}) for ICP")
                         continue
-                    
-                    # # Generate grasps directly from detected object points
-                    
-                    # grasp_poses = generate_grasps_from_detection(
-                    #     object_points,  # Detected object points
-                    #     fused_workspace_np  # Optional: for collision checking
-                    # )
-                    
-                    # if grasp_poses:
-                    #     # Use first grasp pose
-                    #     best_grasp = grasp_poses[0]
-                    #     grasp_position = best_grasp[:3, 3]
-                    #     grasp_orientation = best_grasp[:3, :3]
-                        
-                    #     self.get_logger().info(f"Generated {len(grasp_poses)} grasps for {self.class_names.get(class_id, 'Unknown')}")
-                    #     self.get_logger().info(f"Best grasp position: {grasp_position}")
                         
                     # Convert object points to Open3D format
                     object_cloud = o3d.geometry.PointCloud()
@@ -601,8 +651,13 @@ class ZedGpuNode(Node):
                     if class_id in [1]:  # Cone
                         self.get_logger().info(f"Processing {self.class_names.get(class_id, 'Unknown')} for ICP")
                         
-                        # Run ICP to get pose
-                        pose_matrix = self.estimate_pose_with_icp2(object_cloud, pcd_fused_workspace)
+                        # Run Colored ICP to get pose
+                        pose_matrix = self.estimate_pose_with_colored_icp(object_cloud, fused_workspace_colored_processed)
+                        
+                        # # Fallback to geometric ICP if colored fails
+                        # if pose_matrix is None:
+                        #     self.get_logger().info("Colored ICP failed, trying geometric ICP")
+                        #     pose_matrix = self.estimate_pose_with_icp(object_cloud, fused_workspace_np)
                         
                         if pose_matrix is not None:
                             # Extract and publish pose
@@ -638,7 +693,7 @@ class ZedGpuNode(Node):
                             pose_msg.header.frame_id = self.target_frame
                             pose_msg.pose.position.x = float(position[0])
                             pose_msg.pose.position.y = float(position[1])
-                            pose_msg.pose.position.z =  float(position[2])
+                            pose_msg.pose.position.z =  0.05
                             pose_msg.pose.orientation.x = float(quat[0])
                             pose_msg.pose.orientation.y = float(quat[1])
                             pose_msg.pose.orientation.z = float(quat[2])
@@ -656,83 +711,9 @@ class ZedGpuNode(Node):
                             # Visualize alignment if requested
                             # if self.visualize_icp:
                             #     self.visualize_alignment(pcd_fused_workspace, pose_matrix)
-                            
                 
                 icp_time = time.time() - icp_start
                 self.timings["ICP"].append(icp_time)
-            
-            # Step 8: Generate grasps using superquadric fitting if enabled
-            if self.superquadric_enabled and fused_object_points and len(fused_object_points) > 0:
-                grasp_start = time.time()
-                
-                # Process each detected object with superquadric fitting
-                for i, (object_points, class_id) in enumerate(zip(fused_object_points, fused_object_classes)):
-                    # Skip if too few points
-                    if len(object_points) < 100:
-                        self.get_logger().warn(f"Object {i} has too few points ({len(object_points)}) for superquadric fitting")
-                        continue
-                    
-                    # Class-specific processing for objects (e.g., for cones)
-                    if class_id in [1]:  # Cone
-                        self.get_logger().info(f"Processing {self.class_names.get(class_id, 'Unknown')} with superquadric fitting")
-                        
-                        try:
-                            # Generate grasps using superquadric fitting
-                            grasp_poses = self.generate_superquadric_grasps(
-                                object_points, 
-                                fused_workspace_np,
-                                class_id
-                            )
-                            
-                            if grasp_poses and len(grasp_poses) > 0:
-                                # Use the best grasp pose
-                                best_grasp = grasp_poses[0]
-                                position = best_grasp[:3, 3]
-                                rotation_matrix = best_grasp[:3, :3]
-                                rotation = Rotation.from_matrix(rotation_matrix)
-                                quat = rotation.as_quat()  # x, y, z, w
-                                
-                                # Create pose message
-                                pose_msg = PoseStamped()
-                                pose_msg.header = Header()
-                                pose_msg.header.stamp = self.get_clock().now().to_msg()
-                                pose_msg.header.frame_id = self.target_frame
-                                pose_msg.pose.position.x = float(position[0])
-                                pose_msg.pose.position.y = float(position[1])
-                                pose_msg.pose.position.z = float(position[2])
-                                pose_msg.pose.orientation.x = float(quat[0])
-                                pose_msg.pose.orientation.y = float(quat[1])
-                                pose_msg.pose.orientation.z = float(quat[2])
-                                pose_msg.pose.orientation.w = float(quat[3])
-                                
-                                # Publish grasp pose
-                                self.pose_publisher.publish(pose_msg)
-                                self.get_logger().info(f"Published superquadric grasp for {self.class_names.get(class_id, 'Unknown')} at position: [{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}]")
-                                
-                                if self.publish_tf:
-                                    self.publish_transform(position, quat, self.target_frame, f"superquadric_grasp_{self.class_names.get(class_id, 'object')}_{i}")
-                                
-                        except Exception as e:
-                            self.get_logger().error(f"Error in superquadric grasp generation for object {i}: {e}")
-                            self.get_logger().error(traceback.format_exc())
-                            
-                            # Fallback to direct grasp generation if superquadric fails
-                            self.get_logger().info("Falling back to direct grasp generation")
-                            try:
-                                fallback_grasps = generate_grasps_from_detection(
-                                    object_points,
-                                    fused_workspace_np
-                                )
-                                if fallback_grasps and len(fallback_grasps) > 0:
-                                    best_fallback = fallback_grasps[0]
-                                    position = best_fallback[:3, 3]
-                                    self.get_logger().info(f"Fallback grasp position: [{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}]")
-                            except Exception as fallback_error:
-                                self.get_logger().error(f"Fallback grasp generation also failed: {fallback_error}")
-                
-                grasp_time = time.time() - grasp_start
-                self.timings["Superquadric Grasp Generation"] = self.timings.get("Superquadric Grasp Generation", [])
-                self.timings["Superquadric Grasp Generation"].append(grasp_time)
             
             # Create header for point cloud messages
             header = Header()
@@ -871,6 +852,248 @@ class ZedGpuNode(Node):
         eigenvalues, eigenvectors = np.linalg.eigh(cov)
         idx = np.argsort(eigenvalues)[::-1]
         return eigenvalues[idx], eigenvectors[:, idx]
+    
+    def estimate_pose_with_colored_icp(self, observed_cloud, full_cloud):
+        if len(observed_cloud.points) < 10:
+            self.get_logger().warn("Not enough points for ICP registration")
+            return None
+
+        # --- Prepare reference point cloud with colors
+        ref_points = np.asarray(self.processed_ref_points.copy())
+        ref_pcd = o3d.geometry.PointCloud()
+        ref_pcd.points = o3d.utility.Vector3dVector(ref_points)
+        
+        # Add orange color to reference model if it doesn't have colors
+        if not ref_pcd.has_colors():
+            orange_color = np.tile([1.0, 0.65, 0.0], (len(ref_points), 1))  # Orange color
+            ref_pcd.colors = o3d.utility.Vector3dVector(orange_color)
+
+        # --- Get centers
+        source_center = ref_pcd.get_center()
+        target_center = observed_cloud.get_center()
+
+        # --- Crop full cloud around observed object (maintain colors)
+        ref_size = np.array(ref_pcd.get_max_bound()) - np.array(ref_pcd.get_min_bound())
+        cropped_cloud = full_cloud.crop(o3d.geometry.AxisAlignedBoundingBox(
+            min_bound=target_center - 1.2 * ref_size,
+            max_bound=target_center + 1.2 * ref_size
+        ))
+        
+        # visualize cropped cloud
+        o3d.visualization.draw_geometries([cropped_cloud], window_name="Cropped Cloud for ICP")
+        
+
+        # Ensure both clouds have colors for colored ICP
+        if not observed_cloud.has_colors():
+            gray_color = np.tile([0.5, 0.5, 0.5], (len(observed_cloud.points), 1))
+            observed_cloud.colors = o3d.utility.Vector3dVector(gray_color)
+            
+        if not cropped_cloud.has_colors():
+            white_color = np.tile([1.0, 1.0, 1.0], (len(cropped_cloud.points), 1))
+            cropped_cloud.colors = o3d.utility.Vector3dVector(white_color)
+
+        # --- PCA for initial alignment (using geometry only, not colors)
+        obs_evals, obs_basis = self.get_pca_basis(np.asarray(observed_cloud.points))
+        ref_evals, ref_basis = self.get_pca_basis(ref_points)
+
+        self.get_logger().info(f"Observed eigenvalues: {obs_evals}")
+        self.get_logger().info(f"Reference eigenvalues: {ref_evals}")
+
+        # Try different PCA alignments for initial transformation
+        pca_axis_orders = [(0, 1), (1, 2), (2, 0)]
+        flip_configs = [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+
+        best_initial_result = {
+            "fitness": 0.0,
+            "transformation": None,
+            "config": ""
+        }
+
+        for axis_pair in pca_axis_orders:
+            i1, i2 = axis_pair
+            for flip1, flip2 in flip_configs:
+                # --- Observed basis
+                pc1_obs = obs_basis[:, i1] * flip1
+                pc2_obs = obs_basis[:, i2] * flip2
+                pc2_obs -= np.dot(pc2_obs, pc1_obs) * pc1_obs
+                pc2_obs /= np.linalg.norm(pc2_obs)
+                pc3_obs = np.cross(pc1_obs, pc2_obs)
+                obs_rot = np.column_stack([pc1_obs, pc2_obs, pc3_obs])
+
+                # --- Reference basis
+                pc1_ref = ref_basis[:, 0]
+                pc2_ref = ref_basis[:, 1]
+                pc2_ref -= np.dot(pc2_ref, pc1_ref) * pc1_ref
+                pc2_ref /= np.linalg.norm(pc2_ref)
+                pc3_ref = np.cross(pc1_ref, pc2_ref)
+                ref_rot = np.column_stack([pc1_ref, pc2_ref, pc3_ref])
+
+                # --- Initial transformation
+                R = obs_rot @ ref_rot.T
+                T = np.eye(4)
+                T[:3, :3] = R
+                T[:3, 3] = target_center - R @ source_center
+
+                # Quick test with largest voxel size
+                try:
+                    transformed_ref = o3d.geometry.PointCloud(ref_pcd)
+                    transformed_ref.transform(T)
+                    
+                    # Test with coarse resolution for speed
+                    test_source = transformed_ref.voxel_down_sample(0.02)
+                    test_target = cropped_cloud.voxel_down_sample(0.02)
+                    
+                    test_result = o3d.pipelines.registration.registration_colored_icp(
+                        test_source, test_target, 0.04, np.eye(4),
+                        o3d.pipelines.registration.TransformationEstimationForColoredICP(),
+                        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=10)
+                    )
+                    
+                    if test_result.fitness > best_initial_result["fitness"]:
+                        best_initial_result.update({
+                            "fitness": test_result.fitness,
+                            "transformation": T,
+                            "config": f"PC{i1}-{i2}_flip1={flip1}_flip2={flip2}"
+                        })
+                        
+                except RuntimeError:
+                    continue  # Skip this configuration if it fails
+
+        if best_initial_result["transformation"] is None:
+            self.get_logger().warn("Failed to find initial alignment for colored ICP")
+            return None
+
+        self.get_logger().info(f"Best initial config: {best_initial_result['config']} with fitness {best_initial_result['fitness']:.3f}")
+
+        # --- Use much smaller voxel sizes for small objects like cones
+        voxel_radius = [0.005, 0.004, 0.003]  # Much smaller: 8mm, 5mm, 3mm
+        max_iter = [30, 20, 15]               # Fewer iterations since we have more points
+        current_transformation = best_initial_result["transformation"]
+        
+        self.get_logger().info("Starting multi-scale colored point cloud registration with fine voxel sizes")
+        
+        # Transform reference with initial alignment
+        source = o3d.geometry.PointCloud(ref_pcd)
+        source.transform(current_transformation)
+        target = cropped_cloud
+        
+        # Debug: Check initial point counts
+        self.get_logger().info(f"Initial point counts - Source: {len(source.points)}, Target: {len(target.points)}")
+        
+        # visualize initial alignment
+        o3d.visualization.draw_geometries(
+            [source, target],
+            window_name="Initial Alignment for Colored ICP",
+            zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1]
+        )
+        self.get_logger().info("Initial alignment done, starting multi-scale ICP")
+        
+        try:
+            for scale in range(3):
+                iter_count = max_iter[scale]
+                radius = voxel_radius[scale]
+                
+                self.get_logger().info(f"Scale {scale}: radius={radius:.3f}, iterations={iter_count}")
+
+                # Smart downsampling - only downsample if we have enough points
+                if len(source.points) > 200:
+                    source_down = source.voxel_down_sample(radius)
+                    self.get_logger().info(f"Downsampled source from {len(source.points)} to {len(source_down.points)} points")
+                else:
+                    source_down = source
+                    self.get_logger().info(f"Source too small ({len(source.points)} points), skipping downsampling")
+
+                if len(target.points) > 200:
+                    target_down = target.voxel_down_sample(radius)
+                    self.get_logger().info(f"Downsampled target from {len(target.points)} to {len(target_down.points)} points")
+                else:
+                    target_down = target
+                    self.get_logger().info(f"Target too small ({len(target.points)} points), skipping downsampling")
+                
+                # Check if we have enough points for meaningful ICP
+                if len(source_down.points) < 20 or len(target_down.points) < 20:
+                    self.get_logger().warn(f"Too few points for scale {scale} - Source: {len(source_down.points)}, Target: {len(target_down.points)}")
+                    self.get_logger().warn("Skipping this scale")
+                    continue
+                
+                # visualize downsampled clouds
+                o3d.visualization.draw_geometries(
+                    [source_down, target_down],
+                    window_name=f"Downsampled Clouds - Scale {scale}",
+                    zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1]
+                )
+                self.get_logger().info(f"Downsampled clouds - Source: {len(source_down.points)}, Target: {len(target_down.points)}")
+
+                # Estimate normals AFTER downsampling
+                source_down.estimate_normals(
+                    search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                        radius=radius * 3, max_nn=30  # Larger search radius for small point clouds
+                    )
+                )
+                target_down.estimate_normals(
+                    search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                        radius=radius * 3, max_nn=30
+                    )
+                )
+                
+                # Apply colored point cloud registration
+                result_icp = o3d.pipelines.registration.registration_colored_icp(
+                    source_down, target_down, radius, np.eye(4),  # Use identity for relative transformation
+                    o3d.pipelines.registration.TransformationEstimationForColoredICP(),
+                    o3d.pipelines.registration.ICPConvergenceCriteria(
+                        relative_fitness=1e-6,
+                        relative_rmse=1e-6,
+                        max_iteration=iter_count
+                    )
+                )
+                
+                # Update cumulative transformation
+                current_transformation = result_icp.transformation @ current_transformation
+                
+                # Transform source for next iteration
+                source.transform(result_icp.transformation)
+                
+                self.get_logger().info(
+                    f"Scale {scale} result - Fitness: {result_icp.fitness:.3f}, "
+                    f"RMSE: {result_icp.inlier_rmse:.5f}"
+                )
+                
+                # Early termination if fitness is very good
+                if result_icp.fitness > 0.95:
+                    self.get_logger().info(f"Excellent fitness achieved at scale {scale}, terminating early")
+                    break
+            
+            # Final result
+            final_fitness = result_icp.fitness
+            final_rmse = result_icp.inlier_rmse
+            
+            self.get_logger().info(
+                f"Multi-scale colored ICP completed - Final fitness: {final_fitness:.3f}, "
+                f"RMSE: {final_rmse:.5f}"
+            )
+            
+            # Visualization if enabled
+            if self.visualize_icp:
+                final_ref = o3d.geometry.PointCloud(ref_pcd)
+                final_ref.transform(current_transformation)
+                coord = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
+
+                o3d.visualization.draw_geometries(
+                    [target, final_ref, coord],
+                    window_name="Multi-scale Colored ICP Result",
+                    zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1]
+                )
+            
+            return current_transformation
+            
+        except RuntimeError as e:
+            self.get_logger().warn(f"Multi-scale colored ICP failed: {e}")
+            return None
+        except Exception as e:
+            self.get_logger().error(f"Unexpected error in multi-scale colored ICP: {e}")
+            return None
+
+
     
     def estimate_pose_with_icp(self, observed_cloud, full_cloud):
         if len(observed_cloud.points) < 10:
@@ -1075,50 +1298,7 @@ class ZedGpuNode(Node):
                 zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1],
                 window_name="Cropped Workspace Cloud with PCA"
             )
-            
-            ################################################
-            # save observed and cropped clouds to files - XYZ only for EMS compatibility
-            observed_xyz = o3d.geometry.PointCloud()
-            observed_xyz.points = observed_cloud.points  # Copy only points, no colors/normals
-            
-            # filter SOR
-            # observed_xyz, _ = observed_xyz.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-            # observed_xyz = self.preprocess_point_cloud(observed_xyz)
-            # observed_xyz = observed_xyz.voxel_down_sample(voxel_size=self.voxel_size)
-            
-            cropped_xyz = o3d.geometry.PointCloud()
-            cropped_xyz.points = cropped_cloud.points  # Copy only points, no colors/normals
-            
-            # remove z below 0.005
-            cropped_xyz.points = o3d.utility.Vector3dVector(
-                np.asarray(cropped_xyz.points)[np.asarray(cropped_xyz.points)[:, 2] > 0.005]
-            )
-            
-            # filter SOR
-            cropped_xyz, _ = cropped_xyz.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-            cropped_xyz = self.preprocess_point_cloud(cropped_xyz)
-            
-            cropped_xyz2 = o3d.geometry.PointCloud()
-            cropped_xyz2.points = cropped_xyz.points  # Copy only points, no colors/normals
-            
-            o3d.visualization.draw_geometries(
-                [observed_xyz, coord_frame],
-                zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1],
-                window_name="Observed Object Cloud (XYZ only)"
-            )
-            o3d.visualization.draw_geometries(
-                [cropped_xyz2, coord_frame],
-                zoom=0.7, front=[0, -1, 0], lookat=target_center, up=[0, 0, 1],
-                window_name="Cropped Workspace Cloud (XYZ only)"
-            )
-            # observed_xyz_real = observed_xyz.points
-            # observed_xyz_real = np.asarray(observed_xyz_real)
-            
-            # Save as ASCII PLY for better compatibility
-            o3d.io.write_point_cloud("pointclouds/observed_cloud.ply", observed_xyz)
-            o3d.io.write_point_cloud("pointclouds/cropped_cloud.ply", cropped_xyz2)
-            ################################################
-            
+
         # Compute PCA bases
         obs_evals, obs_basis = self.get_pca_basis(np.asarray(observed_cloud.points))
         ref_evals, ref_basis = self.get_pca_basis(reference_points)
@@ -1248,81 +1428,6 @@ class ZedGpuNode(Node):
         return best_result["transformation"]
 
         
-    def generate_superquadric_grasps(self, object_points, workspace_points, class_id):
-        """
-        Generate grasps using superquadric fitting and the learning-free approach
-        
-        Args:
-            object_points: numpy array of detected object points (Nx3)
-            workspace_points: numpy array of workspace points for context
-            class_id: detected object class ID
-            
-        Returns:
-            List of 4x4 grasp pose transformation matrices
-        """
-        try:
-            # Save object points to temporary file for EMS processing
-            temp_file = f"/tmp/object_points_{class_id}_{int(time.time())}.ply"
-            
-            # Create Open3D point cloud and save
-            object_cloud = o3d.geometry.PointCloud()
-            object_cloud.points = o3d.utility.Vector3dVector(object_points)
-            
-            # Clean the point cloud
-            object_cloud = self.preprocess_point_cloud(object_cloud)
-            
-            # Save as PLY file (XYZ only)
-            object_xyz = o3d.geometry.PointCloud()
-            object_xyz.points = object_cloud.points
-            o3d.io.write_point_cloud(temp_file, object_xyz)
-            
-            self.get_logger().info(f"Saved {len(object_points)} object points to {temp_file}")
-            
-            # Fit superquadric using EMS
-            self.get_logger().info("Fitting superquadric to object points...")
-            
-            # Load points for EMS (it expects numpy array)
-            points_for_ems = np.asarray(object_cloud.points)
-            
-            # Run EMS recovery
-            sq_recovered, probabilities = EMS_recovery(
-                points_for_ems,
-                OutlierRatio=self.outlier_ratio,
-                MaxIterationEM=20,
-                ToleranceEM=1e-3,
-                AdaptiveUpperBound=True,
-                Rescale=False
-            )
-            
-            self.get_logger().info(f"Superquadric fitted successfully!")
-            self.get_logger().info(f"Shape parameters (ε1, ε2): ({sq_recovered.shape[0]:.3f}, {sq_recovered.shape[1]:.3f})")
-            self.get_logger().info(f"Scale parameters (a1, a2, a3): ({sq_recovered.scale[0]:.3f}, {sq_recovered.scale[1]:.3f}, {sq_recovered.scale[2]:.3f})")
-            self.get_logger().info(f"Translation: ({sq_recovered.translation[0]:.3f}, {sq_recovered.translation[1]:.3f}, {sq_recovered.translation[2]:.3f})")
-            
-            # Generate grasps using the fitted superquadric
-            grasp_poses = self.grasp_planner.plan_grasps(
-                temp_file,  # point cloud file
-                sq_recovered.shape,      # [ε1, ε2]
-                sq_recovered.scale,      # [a1, a2, a3]
-                sq_recovered.euler,      # [roll, pitch, yaw]
-                sq_recovered.translation # [tx, ty, tz]
-            )
-            
-            # Clean up temporary file
-            try:
-                os.remove(temp_file)
-            except:
-                pass
-            
-            self.get_logger().info(f"Generated {len(grasp_poses)} superquadric-based grasps")
-            
-            return grasp_poses
-            
-        except Exception as e:
-            self.get_logger().error(f"Error in superquadric grasp generation: {e}")
-            self.get_logger().error(traceback.format_exc())
-            return []
-
     def publish_transform(self, position, quaternion, parent_frame, child_frame):
         """Publish a transform to the tf tree"""
         try:
