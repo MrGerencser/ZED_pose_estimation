@@ -37,5 +37,6 @@ setup(
             'zed_gpu_node = zed_pose_estimation.zed_gpu_node:main',
             'superquadric_grasp_node = zed_pose_estimation.superquadric_grasp_node:main',
             'grasp_executor = zed_pose_estimation.grasp_executor:main',
+        ]
     },
 )
